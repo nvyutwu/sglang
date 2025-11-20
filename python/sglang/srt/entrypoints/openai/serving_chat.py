@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+payload_logger = logging.getLogger("sglang.payload")
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
@@ -609,10 +611,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # State tracking for streaming
         is_firsts = {}
-        stream_buffers = {}
+        stream_buffers = {}  # Cleaned content (no reasoning)
+        reasoning_buffers = {}  # Track reasoning content separately
+        full_text_buffers = {}  # Track full text position for delta calculation
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
+        response_id = ""  # Track the response ID sent to user
 
         # Usage tracking
         prompt_tokens = {}
@@ -632,6 +637,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+
+                # Capture the response ID (same for all chunks)
+                if not response_id and "id" in content["meta_info"]:
+                    response_id = content["meta_info"]["id"]
 
                 # Handle logprobs
                 finish_reason = content["meta_info"]["finish_reason"]
@@ -674,16 +683,21 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
-                stream_buffer = stream_buffers.get(index, "")
-                delta = content["text"][len(stream_buffer) :]
-                stream_buffers[index] = stream_buffer + delta
-
-                # Handle reasoning content
+                # Calculate delta from full text (including reasoning)
+                full_text_buffer = full_text_buffers.get(index, "")
+                delta = content["text"][len(full_text_buffer):]
+                full_text_buffers[index] = content["text"]
+                
+                # Handle reasoning content - extract reasoning and get cleaned delta
                 if self.reasoning_parser and request.separate_reasoning:
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
                     )
                     if reasoning_text:
+                        # Accumulate reasoning content in buffer
+                        reasoning_buffer = reasoning_buffers.get(index, "")
+                        reasoning_buffers[index] = reasoning_buffer + reasoning_text
+                        
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(reasoning_content=reasoning_text),
@@ -707,20 +721,21 @@ class OpenAIServingChat(OpenAIServingBase):
                             )
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
-
+                
                 # Handle tool calls
                 if (
                     request.tool_choice != "none"
                     and request.tools
                     and self.tool_call_parser
                 ):
-                    async for chunk in self._process_tool_call_stream(
+                    async for chunk, normal_text_delta in self._process_tool_call_stream(
                         index,
                         delta,
                         parser_dict,
                         content,
                         request,
                         has_tool_calls,
+                        stream_buffers,
                     ):
                         if chunk:
                             yield chunk
@@ -733,9 +748,16 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         if remaining_chunk:
                             yield remaining_chunk
+                    
+                    # Note: stream_buffers now includes normal_text from tool call parser
+                    # so all tokens are captured in the final aggregated log
 
                 else:
-                    # Regular content
+                    # Regular content - update stream_buffers with the CLEANED delta
+                    # This ensures content field only has non-reasoning text
+                    stream_buffer = stream_buffers.get(index, "")
+                    stream_buffers[index] = stream_buffer + delta
+                    
                     if delta:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
@@ -855,6 +877,92 @@ class OpenAIServingChat(OpenAIServingBase):
         except ValueError as e:
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+
+        # Log streaming response with full content after completion
+        try:
+            if os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1":
+                # Build full response with actual content
+                choices = []
+                # Get all indices that had responses (from finish_reasons, which tracks all completed indices)
+                all_indices = set(finish_reasons.keys())
+                for idx in all_indices:
+                    stream_content = stream_buffers.get(idx, "")
+                    message = {
+                        "role": "assistant",
+                        "content": stream_content if stream_content else None,
+                    }
+                    
+                    # Add reasoning_content separately if present
+                    reasoning_content = reasoning_buffers.get(idx, "")
+                    if reasoning_content:
+                        message["reasoning_content"] = reasoning_content
+                    
+                    # Reconstruct tool_calls from parser state if tool calls were present
+                    if has_tool_calls.get(idx, False) and idx in parser_dict:
+                        parser = parser_dict[idx]
+                        tool_calls = []
+                        
+                        # Get the detector from the parser
+                        detector = parser.detector if hasattr(parser, "detector") else parser
+                        
+                        # Check if detector has accumulated tool calls
+                        if hasattr(detector, "prev_tool_call_arr") and detector.prev_tool_call_arr:
+                            history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
+                            
+                            for tool_idx, tool_data in enumerate(detector.prev_tool_call_arr):
+                                # Create a ToolCallItem for ID generation
+                                call_item = ToolCallItem(
+                                    tool_index=tool_idx,
+                                    name=tool_data.get("name", ""),
+                                    parameters="",  # Not needed for ID generation
+                                )
+                                tool_call_id = self._process_tool_call_id(call_item, history_tool_calls_cnt)
+                                
+                                tool_calls.append({
+                                    "id": tool_call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_data.get("name", ""),
+                                        "arguments": json.dumps(tool_data.get("arguments", {}), ensure_ascii=False)
+                                    }
+                                })
+                            
+                            if tool_calls:
+                                message["tool_calls"] = tool_calls
+                    
+                    choice = {
+                        "index": idx,
+                        "message": message,
+                        "finish_reason": finish_reasons.get(idx, {}).get("type", "unknown"),
+                    }
+                    choices.append(choice)
+                
+                # Use the response_id we captured during streaming
+                response_payload = {
+                    "id": response_id,
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": request.model,
+                    "choices": choices,
+                    "usage": {
+                        "prompt_tokens": sum(prompt_tokens.values()),
+                        "completion_tokens": sum(completion_tokens.values()),
+                        "total_tokens": sum(prompt_tokens.values()) + sum(completion_tokens.values()),
+                    },
+                    "stream": True,
+                }
+                
+                payload_logger.info(
+                    "openai.response",
+                    extra={
+                        "rid": getattr(adapted_request, "rid", ""),
+                        "endpoint": self.__class__.__name__,
+                        # Log structured JSON; exporter will handle serialization
+                        "payload": response_payload,
+                    },
+                )
+        except Exception as log_err:
+            logger.warning(f"Failed to log streaming response: {log_err}")
 
         yield "data: [DONE]\n\n"
 
@@ -1235,6 +1343,7 @@ class OpenAIServingChat(OpenAIServingBase):
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],
+        stream_buffers: Dict[int, str],
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
@@ -1258,8 +1367,12 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
 
-        # Yield normal text
+        # Yield normal text and accumulate in stream_buffers for final log
         if normal_text:
+            # Accumulate normal text so it appears in final aggregated log
+            stream_buffer = stream_buffers.get(index, "")
+            stream_buffers[index] = stream_buffer + normal_text
+            
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(content=normal_text),
@@ -1281,7 +1394,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens=completion_tokens,
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json()}\n\n", normal_text
 
         # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
@@ -1331,7 +1444,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens=completion_tokens,
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json()}\n\n", None
 
     def _check_for_unstreamed_tool_args(
         self,

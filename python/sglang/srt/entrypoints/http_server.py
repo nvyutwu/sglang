@@ -37,6 +37,12 @@ from typing import (
     Union,
 )
 
+from sglang.srt.tracing.otel_instrumentation import (
+    init_otel as _otel_init,
+    start_prom_to_otel_bridge as _otel_start_prom_bridge,
+)
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -257,6 +263,21 @@ async def lifespan(fast_api_app: FastAPI):
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
         enable_func_timer()
+
+    # Initialize OTEL logs/metrics (traces handled separately by sglang tracing)
+    try:
+        meter, _tracer_unused, log_handler = _otel_init({"service.name": "sglang"})
+        if log_handler is not None:
+            root_logger = logging.getLogger()
+            root_logger.addHandler(log_handler)
+            if root_logger.level > logging.INFO:
+                root_logger.setLevel(logging.INFO)
+        prom_scrape = os.getenv("OTEL_PROM_SCRAPE_URL")
+        if prom_scrape:
+            interval = float(os.getenv("OTEL_PROM_SCRAPE_INTERVAL", "10"))
+            _otel_start_prom_bridge(prom_scrape, interval_seconds=interval)
+    except Exception:
+        pass
 
     # Init tracing
     if server_args.enable_trace:

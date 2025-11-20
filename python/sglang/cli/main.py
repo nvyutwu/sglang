@@ -22,14 +22,20 @@ def main():
         help="Launch the SGLang server.",
         add_help=False,  # Defer help to the specific parser
     )
-    serve_parser.set_defaults(func=serve)
+    def _serve_entry(args, extra_argv):
+        from sglang.cli.serve import serve as _serve
+        return _serve(args, extra_argv)
+    serve_parser.set_defaults(func=_serve_entry)
 
     generate_parser = subparsers.add_parser(
         "generate",
         help="Run inference on a multimodal model.",
         add_help=False,  # Defer help to the specific parser
     )
-    generate_parser.set_defaults(func=generate)
+    def _generate_entry(args, extra_argv):
+        from sglang.cli.generate import generate as _generate
+        return _generate(args, extra_argv)
+    generate_parser.set_defaults(func=_generate_entry)
 
     # simple commands
     version_parser = subparsers.add_parser(

@@ -963,7 +963,7 @@ class HiRadixCache(RadixCache):
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_storage_metrics(
+            self.metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
 
