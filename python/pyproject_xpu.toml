@@ -73,11 +73,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+otel = [
+  "opentelemetry-api==1.38.0",
+  "opentelemetry-exporter-otlp==1.38.0",
+  "opentelemetry-exporter-otlp-proto-grpc==1.38.0",
+  "opentelemetry-sdk==1.38.0",
+]
 tracing = [
-  "opentelemetry-sdk",
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
   "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
 ]
 test = [
   "accelerate",
@@ -90,7 +96,17 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
-all = []
+
+logging = [
+  "kratos-cli==4.0.93",
+]
+
+all = [
+  "opentelemetry-api==1.38.0",
+  "opentelemetry-exporter-otlp==1.38.0",
+  "opentelemetry-exporter-otlp-proto-grpc==1.38.0",
+  "opentelemetry-sdk==1.38.0",
+]
 dev = ["sglang[test]"]
 
 [project.urls]

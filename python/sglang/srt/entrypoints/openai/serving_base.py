@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -104,6 +105,8 @@ class OpenAIServingBase(ABC):
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
             )
+            payload_logging = os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1"
+            rid_for_log = ""
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
@@ -111,15 +114,84 @@ class OpenAIServingBase(ABC):
                 adapted_request.received_time = received_time
                 adapted_request.received_time_perf = received_time_perf
 
+            if payload_logging:
+                # Derive a stable rid value for logging without mutating internal rid fields.
+                try:
+                    rid = (
+                        getattr(processed_request, "rid", None)
+                        or getattr(request, "rid", None)
+                        or getattr(adapted_request, "rid", None)
+                    )
+                except Exception:
+                    rid = None
+
+                if isinstance(rid, list):
+                    rid_for_log = rid[0] if rid else ""
+                else:
+                    rid_for_log = rid or ""
+
+                if not rid_for_log:
+                    rid_for_log = uuid.uuid4().hex
+
+                headers_obj = None
+                if raw_request is not None:
+                    try:
+                        headers_obj = {k: v for k, v in raw_request.headers.items()}
+                    except Exception:
+                        headers_obj = None
+
+                try:
+                    req_payload = request.model_dump()
+                except Exception:
+                    req_payload = None
+
+                logging.getLogger("sglang.payload").info(
+                    "openai.request",
+                    extra={
+                        "rid": rid_for_log,
+                        "endpoint": self.__class__.__name__,
+                        "payload": req_payload,
+                        "headers": headers_obj,
+                    },
+                )
+
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
-                return await self._handle_streaming_request(
+                result = await self._handle_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
             else:
-                return await self._handle_non_streaming_request(
+                result = await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+
+            if payload_logging and not isinstance(result, StreamingResponse):
+                try:
+                    if hasattr(result, "model_dump"):
+                        res_payload = result.model_dump()
+                    elif isinstance(result, ORJSONResponse):
+                        body = result.body
+                        if isinstance(body, (bytes, bytearray)):
+                            try:
+                                res_payload = orjson.loads(body)
+                            except Exception:
+                                res_payload = body.decode(errors="replace")
+                        else:
+                            res_payload = body
+                    else:
+                        res_payload = str(result)
+                except Exception:
+                    res_payload = None
+                logging.getLogger("sglang.payload").info(
+                    "openai.response",
+                    extra={
+                        "rid": rid_for_log,
+                        "endpoint": self.__class__.__name__,
+                        "payload": res_payload,
+                    },
+                )
+
+            return result
         except HTTPException as e:
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code

@@ -68,11 +68,17 @@ runtime_common = [
   "grpcio-reflection>=1.78.0",
 ]
 
+otel = [
+  "opentelemetry-api==1.38.0",
+  "opentelemetry-exporter-otlp==1.38.0",
+  "opentelemetry-exporter-otlp-proto-grpc==1.38.0",
+  "opentelemetry-sdk==1.38.0",
+]
 tracing = [
-  "opentelemetry-sdk",
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
   "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -141,6 +147,10 @@ test = [
   "pytest",
   "sentence_transformers",
   "tabulate",
+]
+
+logging = [
+  "kratos-cli==4.0.93",
 ]
 
 all_hip = ["sglang[srt_hip]", "sglang[diffusion_hip]"]
