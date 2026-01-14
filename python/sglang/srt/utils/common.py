@@ -1553,6 +1553,23 @@ def delete_directory(dirpath):
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
 
+def _clean_prometheus_multiproc_dir(dirpath: str) -> None:
+    """Clean stale metric files from previous runs.
+    
+    This is important for accurate metrics in prometheus multiprocess mode.
+    Stale .db files from crashed/previous processes can cause incorrect aggregation.
+    """
+    if not os.path.isdir(dirpath):
+        return
+    for filename in os.listdir(dirpath):
+        filepath = os.path.join(dirpath, filename)
+        try:
+            if os.path.isfile(filepath):
+                os.unlink(filepath)
+        except OSError as e:
+            logger.warning(f"Failed to clean stale prometheus metric file {filepath}: {e}")
+
+
 def set_prometheus_multiproc_dir():
     # Set prometheus multiprocess directory
     # sglang uses prometheus multiprocess mode
@@ -1561,10 +1578,16 @@ def set_prometheus_multiproc_dir():
     global prometheus_multiproc_dir
 
     if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
-        logger.debug("User set PROMETHEUS_MULTIPROC_DIR detected.")
-        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
-            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
-        )
+        # User specified a directory - use it directly (don't create nested temp dir)
+        user_dir = os.environ["PROMETHEUS_MULTIPROC_DIR"]
+        logger.debug(f"User set PROMETHEUS_MULTIPROC_DIR detected: {user_dir}")
+        # Create directory if it doesn't exist
+        os.makedirs(user_dir, exist_ok=True)
+        # Clean stale metric files from previous runs
+        _clean_prometheus_multiproc_dir(user_dir)
+        # Create a TemporaryDirectory object that points to user's dir (for API consistency)
+        # but won't delete the parent dir on cleanup
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(dir=user_dir)
     else:
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
