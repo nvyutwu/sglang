@@ -290,6 +290,7 @@ class ServerArgs:
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
     context_length: Optional[int] = None
+    max_output_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
@@ -2897,6 +2898,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.context_length,
             help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead).",
+        )
+        parser.add_argument(
+            "--max-output-length",
+            type=int,
+            default=ServerArgs.max_output_length,
+            help="Maximum output sequence length. If set, caps max_new_tokens to this value when max_new_tokens > max_output_length < context_length - input_length.",
         )
         parser.add_argument(
             "--is-embedding",
