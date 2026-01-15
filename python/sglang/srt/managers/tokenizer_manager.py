@@ -776,6 +776,23 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
+
+        # Cap max_new_tokens to max_output_length if set
+        max_output_length = self.server_args.max_output_length
+        remaining_context = _max_req_len - input_token_num
+        if max_output_length is not None and max_output_length < remaining_context:
+            if max_new_tokens is None:
+                # Set max_new_tokens to max_output_length when not provided
+                obj.sampling_params["max_new_tokens"] = max_output_length
+                max_new_tokens = max_output_length
+            elif max_new_tokens > max_output_length:
+                logger.info(
+                    f"Capping max_new_tokens from {max_new_tokens} to {max_output_length} "
+                    f"(max_output_length limit)."
+                )
+                obj.sampling_params["max_new_tokens"] = max_output_length
+                max_new_tokens = max_output_length
+
         if (
             self.validate_total_tokens
             and max_new_tokens is not None
