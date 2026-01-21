@@ -544,9 +544,9 @@ def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool) -> str:
     for line in prefill_delayer_metrics:
         print(line)
     if expect_metrics:
-        assert "sglang:prefill_delayer_wait_forward_passes" in metrics_text
-        assert "sglang:prefill_delayer_wait_seconds" in metrics_text
-        assert "sglang:prefill_delayer_outcomes_total" in metrics_text
+        assert "prefill_delayer_wait_forward_passes" in metrics_text
+        assert "prefill_delayer_wait_seconds" in metrics_text
+        assert "prefill_delayer_outcomes_total" in metrics_text
     return metrics_text
 
 
