@@ -849,6 +849,67 @@ class SchedulerMetricsCollector:
             ],
         )
 
+        # Config info gauges (for PromQL joins with performance metrics)
+        # These are set once at startup and don't change
+        self._log_config_info(server_args)
+
+    def _log_config_info(self, server_args: Optional["ServerArgs"]) -> None:
+        """Log config info gauges for PromQL correlation with performance metrics."""
+        from prometheus_client import Gauge
+
+        if server_args is None:
+            return
+
+        # Model config info
+        model_config_labels = {
+            **self.labels,
+            "model": str(server_args.model_path),
+            "served_model_name": str(server_args.served_model_name or server_args.model_path),
+            "dtype": str(server_args.dtype),
+            "max_total_tokens": str(server_args.max_total_tokens or "auto"),
+            "quantization": str(server_args.quantization or "none"),
+        }
+        model_config_info = Gauge(
+            name="model_config_info",
+            documentation="Information of the engine ModelConfig",
+            labelnames=model_config_labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        model_config_info.labels(**model_config_labels).set(1)
+
+        # Parallel config info
+        parallel_config_labels = {
+            **self.labels,
+            "tensor_parallel_size": str(server_args.tp_size),
+            "pipeline_parallel_size": str(server_args.pp_size),
+            "data_parallel_size": str(server_args.dp_size),
+            "expert_parallel_size": str(server_args.ep_size),
+        }
+        parallel_config_info = Gauge(
+            name="parallel_config_info",
+            documentation="Information of the engine ParallelConfig",
+            labelnames=parallel_config_labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        parallel_config_info.labels(**parallel_config_labels).set(1)
+
+        # Speculative config info (only if speculative decoding is enabled)
+        if server_args.speculative_algorithm is not None:
+            speculative_config_labels = {
+                **self.labels,
+                "spec_enabled": "true",
+                "spec_algorithm": str(server_args.speculative_algorithm),
+                "spec_num_draft_tokens": str(server_args.speculative_num_draft_tokens or 0),
+                "spec_draft_model": str(server_args.speculative_draft_model_path or "none"),
+            }
+            speculative_config_info = Gauge(
+                name="speculative_config_info",
+                documentation="Information of the engine SpeculativeConfig",
+                labelnames=speculative_config_labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            speculative_config_info.labels(**speculative_config_labels).set(1)
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
