@@ -1982,6 +1982,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 else 0
             )
 
+            # Compute timing metrics (vLLM-compatible)
+            prefill_time = None
+            decode_time = None
+            inference_time = None
+            if state.first_token_time > 0:
+                prefill_time = state.first_token_time - state.created_time
+                decode_time = state.finished_time - state.first_token_time
+                inference_time = prefill_time + decode_time
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -1990,6 +1999,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.finished_time - state.created_time,
                 self._request_has_grammar(state.obj),
                 retraction_count,
+                inference_time=inference_time,
+                prefill_time=prefill_time,
+                decode_time=decode_time,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
