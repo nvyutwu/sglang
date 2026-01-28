@@ -1982,11 +1982,34 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 else 0
             )
 
-            # Compute timing metrics (vLLM-compatible)
+            # Compute timing metrics (vLLM-compatible).
+            # Use forward_entry_time (scheduling timestamp) as the start
+            # to exclude queue wait time, matching vLLM's semantics:
+            #   prefill_time  = first_token - scheduled
+            #   decode_time   = last_token  - first_token
+            #   inference_time = last_token - scheduled
             prefill_time = None
             decode_time = None
             inference_time = None
-            if state.first_token_time > 0:
+            forward_entry = (
+                recv_obj.forward_entry_time[i]
+                if (
+                    hasattr(recv_obj, "forward_entry_time")
+                    and recv_obj.forward_entry_time
+                    and recv_obj.forward_entry_time[i] is not None
+                )
+                else None
+            )
+            if (
+                forward_entry is not None
+                and state.first_token_time_perf > 0.0
+                and state.finished_time_perf > 0.0
+            ):
+                prefill_time = state.first_token_time_perf - forward_entry
+                decode_time = state.finished_time_perf - state.first_token_time_perf
+                inference_time = state.finished_time_perf - forward_entry
+            elif state.first_token_time > 0:
+                # Fallback when forward_entry_time not available
                 prefill_time = state.first_token_time - state.created_time
                 decode_time = state.finished_time - state.first_token_time
                 inference_time = prefill_time + decode_time
