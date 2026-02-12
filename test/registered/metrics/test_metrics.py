@@ -43,7 +43,7 @@ class TestEnableMetrics(CustomTestCase):
         def _verify_metrics_extra(metrics):
             metrics_to_check = [
                 (
-                    "sglang:dp_cooperation_realtime_tokens_total",
+                    "dp_cooperation_realtime_tokens_total",
                     {"mode": "prefill_compute"},
                 ),
                 (
@@ -55,7 +55,7 @@ class TestEnableMetrics(CustomTestCase):
                     {"category": "forward_extend"},
                 ),
                 (
-                    "sglang:dp_cooperation_gpu_execution_seconds_total",
+                    "dp_cooperation_gpu_execution_seconds_total",
                     {"category": "forward_decode"},
                 ),
             ]
@@ -63,7 +63,7 @@ class TestEnableMetrics(CustomTestCase):
 
             num_prefill_ranks_values = {
                 s.labels["num_prefill_ranks"]
-                for s in metrics["sglang:dp_cooperation_realtime_tokens_total"]
+                for s in metrics["dp_cooperation_realtime_tokens_total"]
             }
             self.assertIn("0", num_prefill_ranks_values)
             self.assertIn("1", num_prefill_ranks_values)
@@ -133,26 +133,26 @@ class TestEnableMetrics(CustomTestCase):
 
     def _verify_metrics_common(self, metrics_text, metrics):
         essential_metrics = [
-            "sglang:num_running_reqs",
-            "sglang:num_used_tokens",
-            "sglang:token_usage",
-            "sglang:gen_throughput",
-            "sglang:num_queue_reqs",
-            "sglang:num_grammar_queue_reqs",
-            "sglang:cache_hit_rate",
-            "sglang:spec_accept_length",
-            "sglang:prompt_tokens_total",
-            "sglang:generation_tokens_total",
-            "sglang:cached_tokens_total",
-            "sglang:num_requests_total",
-            "sglang:time_to_first_token_seconds",
-            "sglang:inter_token_latency_seconds",
-            "sglang:e2e_request_latency_seconds",
-            "sglang:http_requests_active",
-            "sglang:routing_keys_active",
-            "sglang:num_unique_running_routing_keys",
-            "sglang:routing_key_running_req_count",
-            "sglang:routing_key_all_req_count",
+            "num_requests_running",
+            "num_used_tokens",
+            "kv_cache_usage_perc",
+            "gen_throughput",
+            "num_requests_waiting",
+            "num_grammar_queue_reqs",
+            "cache_hit_rate",
+            "spec_accept_length",
+            "prompt_tokens_total",
+            "generation_tokens_total",
+            "cached_tokens_total",
+            "num_requests_total",
+            "time_to_first_token_seconds",
+            "inter_token_latency_seconds",
+            "e2e_request_latency_seconds",
+            "http_requests_active",
+            "routing_keys_active",
+            "num_unique_running_routing_keys",
+            "routing_key_running_req_count",
+            "routing_key_all_req_count",
         ]
         for metric in essential_metrics:
             self.assertIn(metric, metrics_text, f"Missing metric: {metric}")
@@ -160,8 +160,8 @@ class TestEnableMetrics(CustomTestCase):
         # Verify routing key GaugeHistogram buckets
         expected_buckets = len(ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS) + 1
         for metric_name in [
-            "sglang:routing_key_running_req_count",
-            "sglang:routing_key_all_req_count",
+            "routing_key_running_req_count",
+            "routing_key_all_req_count",
         ]:
             gt_le_pairs = set()
             for sample in metrics.get(metric_name, []):
@@ -178,11 +178,11 @@ class TestEnableMetrics(CustomTestCase):
         self.assertIn("_bucket{", metrics_text)
 
         metrics_to_check = [
-            ("sglang:realtime_tokens_total", {"mode": "prefill_compute"}),
-            ("sglang:realtime_tokens_total", {"mode": "decode"}),
-            ("sglang:gpu_execution_seconds_total", {"category": "forward_extend"}),
-            ("sglang:gpu_execution_seconds_total", {"category": "forward_decode"}),
-            ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
+            ("realtime_tokens_total", {"mode": "prefill_compute"}),
+            ("realtime_tokens_total", {"mode": "decode"}),
+            ("gpu_execution_seconds_total", {"category": "forward_extend"}),
+            ("gpu_execution_seconds_total", {"category": "forward_decode"}),
+            ("process_cpu_seconds_total", {"component": "tokenizer"}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
 

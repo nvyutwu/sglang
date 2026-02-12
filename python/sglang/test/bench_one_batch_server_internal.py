@@ -46,15 +46,15 @@ def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
         prompt_tokens_total = 0.0
 
         for line in response.text.split("\n"):
-            if line.startswith("sglang:cached_tokens_total{"):
+            if line.startswith("cached_tokens_total{"):
                 match = re.search(
-                    r"sglang:cached_tokens_total\{[^}]*\}\s+([\d.eE+-]+)", line
+                    r"cached_tokens_total\{[^}]*\}\s+([\d.eE+-]+)", line
                 )
                 if match:
                     cached_tokens_total += float(match.group(1))
-            elif line.startswith("sglang:prompt_tokens_total{"):
+            elif line.startswith("prompt_tokens_total{"):
                 match = re.search(
-                    r"sglang:prompt_tokens_total\{[^}]*\}\s+([\d.eE+-]+)", line
+                    r"prompt_tokens_total\{[^}]*\}\s+([\d.eE+-]+)", line
                 )
                 if match:
                     prompt_tokens_total += float(match.group(1))

@@ -589,6 +589,12 @@ class Scheduler(
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
 
+        # Store load_weights_time in stats for metrics
+        if hasattr(self.tp_worker.model_runner, "load_weights_time"):
+            self.stats.engine_load_weights_time = (
+                self.tp_worker.model_runner.load_weights_time
+            )
+
         # Print debug info
         if self.tp_rank == 0:
             avail_mem = get_available_gpu_memory(
@@ -3037,6 +3043,8 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
+        # Measure engine startup time
+        engine_startup_start = time.perf_counter()
         scheduler = Scheduler(
             server_args,
             port_args,
@@ -3046,10 +3054,17 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
+        engine_startup_time = time.perf_counter() - engine_startup_start
+
+        # Set the startup time in stats so it flows to metrics
+        scheduler.stats.engine_startup_time = engine_startup_time
+        logger.info(f"Engine startup time: {engine_startup_time:.3f}s")
+
         result_dict = {
             "status": "ready",
             "max_total_num_tokens": scheduler.max_total_num_tokens,
             "max_req_input_len": scheduler.max_req_input_len,
+            "engine_startup_time": engine_startup_time,
         }
         if server_args.remote_instance_weight_loader_use_transfer_engine():
             (
