@@ -1982,6 +1982,47 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 else 0
             )
 
+            # Compute timing metrics (vLLM-compatible).
+            # Use forward_entry_time (scheduling timestamp) as the start
+            # to exclude queue wait time, matching vLLM's semantics:
+            #   prefill_time  = first_token - scheduled
+            #   decode_time   = last_token  - first_token
+            #   inference_time = last_token - scheduled
+            prefill_time = None
+            decode_time = None
+            inference_time = None
+            forward_entry = (
+                recv_obj.forward_entry_time[i]
+                if (
+                    hasattr(recv_obj, "forward_entry_time")
+                    and recv_obj.forward_entry_time
+                    and recv_obj.forward_entry_time[i] is not None
+                )
+                else None
+            )
+            if (
+                forward_entry is not None
+                and state.first_token_time_perf > 0.0
+                and state.finished_time_perf > 0.0
+            ):
+                prefill_time = state.first_token_time_perf - forward_entry
+                decode_time = state.finished_time_perf - state.first_token_time_perf
+                inference_time = state.finished_time_perf - forward_entry
+            elif state.first_token_time > 0:
+                # Fallback when forward_entry_time not available
+                prefill_time = state.first_token_time - state.created_time
+                decode_time = state.finished_time - state.first_token_time
+                inference_time = prefill_time + decode_time
+
+            # Get finish reason string for metrics (vLLM-compatible)
+            finish_reason_str = "stop"  # default
+            if recv_obj.finished_reasons[i] is not None:
+                finish_reason_obj = recv_obj.finished_reasons[i]
+                if hasattr(finish_reason_obj, "to_json"):
+                    finish_reason_str = finish_reason_obj.to_json().get("type", "stop")
+                elif hasattr(finish_reason_obj, "is_error") and finish_reason_obj.is_error:
+                    finish_reason_str = "error"
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -1990,6 +2031,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.finished_time - state.created_time,
                 self._request_has_grammar(state.obj),
                 retraction_count,
+                inference_time=inference_time,
+                prefill_time=prefill_time,
+                decode_time=decode_time,
+                finish_reason=finish_reason_str,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):

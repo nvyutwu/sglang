@@ -803,6 +803,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return min_per_gpu_memory
 
     def load_model(self):
+        load_weights_start = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -988,6 +989,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
+
+        # Record weight loading time for metrics
+        self.load_weights_time = time.perf_counter() - load_weights_start
+        logger.info(f"Load weights time: {self.load_weights_time:.3f}s")
 
     def update_expert_location(
         self,
