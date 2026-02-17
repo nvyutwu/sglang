@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers import mm_utils
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DisaggregationMetrics,
@@ -147,10 +148,20 @@ class SchedulerMetricsMixin:
                 kv_events_config, self.attn_dp_rank
             )
 
-    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
+    def update_spec_metrics(
+        self: Scheduler,
+        bs: int,
+        num_accepted_tokens: int,
+        accept_lengths_per_req: list = None,
+    ):
         self.spec_num_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
+        if self.enable_metrics and accept_lengths_per_req is not None:
+            self.metrics_collector.increment_spec_decode_counters(
+                num_drafts=bs,
+                accept_lengths_per_req=accept_lengths_per_req,
+            )
 
     def reset_metrics(self: Scheduler):
         self.forward_ct_decode = 0
@@ -267,6 +278,16 @@ class SchedulerMetricsMixin:
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.metrics_collector.increment_prefix_cache_counters(
+                queries=total_tokens,
+                hits=prefill_stats.log_hit_tokens,
+            )
+
+            if mm_utils.embedding_cache is not None:
+                mm_queries, mm_hits = mm_utils.embedding_cache.drain_stats()
+                self.metrics_collector.increment_mm_cache_counters(
+                    queries=mm_queries, hits=mm_hits
+                )
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
 

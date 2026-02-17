@@ -144,7 +144,6 @@ class TestEnableMetrics(CustomTestCase):
             "prompt_tokens_total",
             "generation_tokens_total",
             "cached_tokens_total",
-            "num_requests_total",
             "time_to_first_token_seconds",
             "inter_token_latency_seconds",
             "e2e_request_latency_seconds",

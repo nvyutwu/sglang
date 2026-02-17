@@ -2059,6 +2059,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 elif hasattr(finish_reason_obj, "is_error") and finish_reason_obj.is_error:
                     finish_reason_str = "error"
 
+            sampling_params = state.obj.sampling_params
+            max_new_tokens = (
+                sampling_params.get("max_new_tokens")
+                if isinstance(sampling_params, dict)
+                else getattr(sampling_params, "max_new_tokens", None)
+            )
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -2072,6 +2079,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 prefill_time=prefill_time,
                 decode_time=decode_time,
                 finish_reason=finish_reason_str,
+                max_new_tokens=max_new_tokens,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):

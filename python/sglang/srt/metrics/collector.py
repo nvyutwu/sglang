@@ -372,6 +372,27 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.prefix_cache_queries = Counter(
+            name="prefix_cache_queries",
+            documentation="Prefix cache queries, in terms of number of queried tokens.",
+            labelnames=labels.keys(),
+        )
+        self.prefix_cache_hits = Counter(
+            name="prefix_cache_hits",
+            documentation="Prefix cache hits, in terms of number of cached tokens.",
+            labelnames=labels.keys(),
+        )
+
+        self.mm_cache_queries = Counter(
+            name="mm_cache_queries",
+            documentation="Multi-modal cache queries, in terms of number of queried items.",
+            labelnames=labels.keys(),
+        )
+        self.mm_cache_hits = Counter(
+            name="mm_cache_hits",
+            documentation="Multi-modal cache hits, in terms of number of cached items.",
+            labelnames=labels.keys(),
+        )
 
         self.max_total_num_tokens = Gauge(
             name="max_total_num_tokens",
@@ -393,6 +414,33 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+
+        self.spec_decode_num_drafts = Counter(
+            name="spec_decode_num_drafts",
+            documentation="Number of speculative decoding draft attempts.",
+            labelnames=labels.keys(),
+        )
+
+        # Determine number of speculative positions for per-position counter
+        if server_args is not None:
+            draft_tokens_fallback = (server_args.speculative_num_steps or 0) + 1
+            self.num_spec_positions = (
+                server_args.speculative_num_draft_tokens or draft_tokens_fallback
+            )
+        else:
+            self.num_spec_positions = 0
+
+        position_labels = {**labels, "position": ""}
+        self.spec_decode_num_accepted_tokens_per_pos = Counter(
+            name="spec_decode_num_accepted_tokens_per_pos",
+            documentation="Accepted tokens per draft position.",
+            labelnames=position_labels.keys(),
+        )
+        # Pre-create per-position counters
+        for pos in range(self.num_spec_positions):
+            self.spec_decode_num_accepted_tokens_per_pos.labels(
+                **labels, position=str(pos)
+            )
 
         # Retract
         # TODO maybe remove this old gauge in favor of the new counter
@@ -859,7 +907,7 @@ class SchedulerMetricsCollector:
         # Similar to vLLM, https://github.com/vllm-project/vllm/blob/main/vllm/v1/metrics/loggers.py
         # If more Info metrics are needed, we can create a common _log_info function.
         self.cache_config_info = Gauge(
-            name="sglang:cache_config_info",
+            name="cache_config_info",
             documentation="Cache configuration information.",
             labelnames=["page_size", "num_pages"],
             multiprocess_mode="mostrecent",
@@ -1002,6 +1050,46 @@ class SchedulerMetricsCollector:
         self.eplb_balancedness.labels(**self.labels, forward_mode=forward_mode).observe(
             balancedness
         )
+
+    def increment_spec_decode_counters(
+        self, num_drafts: int, accept_lengths_per_req: list
+    ) -> None:
+        """Increment speculative decoding counters (vLLM-compatible).
+
+        Args:
+            num_drafts: Number of draft attempts (= batch size).
+            accept_lengths_per_req: Per-request accepted draft token counts.
+        """
+        self.spec_decode_num_drafts.labels(**self.labels).inc(num_drafts)
+        for accepted in accept_lengths_per_req:
+            for pos in range(accepted):
+                self.spec_decode_num_accepted_tokens_per_pos.labels(
+                    **self.labels, position=str(pos)
+                ).inc(1)
+
+    def increment_prefix_cache_counters(
+        self, queries: int, hits: int
+    ) -> None:
+        """Increment prefix cache counters (vLLM-compatible).
+
+        Args:
+            queries: Total tokens queried against the prefix cache
+                     (= log_input_tokens + log_hit_tokens).
+            hits: Tokens served from the prefix cache (= log_hit_tokens).
+        """
+        if queries > 0:
+            self.prefix_cache_queries.labels(**self.labels).inc(queries)
+        if hits > 0:
+            self.prefix_cache_hits.labels(**self.labels).inc(hits)
+
+    def increment_mm_cache_counters(
+        self, queries: int, hits: int
+    ) -> None:
+        """Increment multi-modal cache counters (vLLM-compatible)."""
+        if queries > 0:
+            self.mm_cache_queries.labels(**self.labels).inc(queries)
+        if hits > 0:
+            self.mm_cache_hits.labels(**self.labels).inc(hits)
 
     def increment_realtime_tokens(
         self,
@@ -1231,15 +1319,9 @@ class TokenizerMetricsCollector:
             )
 
         self.cached_tokens_total = Counter(
-            name="sglang:cached_tokens_total",
+            name="cached_tokens_total",
             documentation="Number of cached prompt tokens by source (device/host/storage).",
             labelnames=list(labels.keys()) + ["cache_source"],
-        )
-
-        self.num_requests_total = Counter(
-            name="num_requests_total",
-            documentation="Number of requests processed.",
-            labelnames=labels.keys(),
         )
 
         self.num_so_requests_total = Counter(
@@ -1432,6 +1514,17 @@ class TokenizerMetricsCollector:
             buckets=request_latency_buckets,
         )
 
+        tpot_buckets = [
+            0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5,
+            0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0, 40.0, 80.0,
+        ]
+        self.histogram_request_time_per_output_token = Histogram(
+            name="request_time_per_output_token_seconds",
+            documentation="Histogram of time per output token per request.",
+            labelnames=labels.keys(),
+            buckets=tpot_buckets,
+        )
+
         # vLLM-compatible request tokens histograms (always created)
         request_tokens_buckets = [
             1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000
@@ -1450,6 +1543,13 @@ class TokenizerMetricsCollector:
             buckets=request_tokens_buckets,
         )
 
+        self.histogram_request_params_max_tokens = Histogram(
+            name="request_params_max_tokens",
+            documentation="Histogram of the max_tokens request parameter.",
+            labelnames=labels.keys(),
+            buckets=request_tokens_buckets,
+        )
+
     def observe_one_finished_request(
         self,
         labels: Dict[str, str],
@@ -1464,6 +1564,7 @@ class TokenizerMetricsCollector:
         prefill_time: Optional[float] = None,
         decode_time: Optional[float] = None,
         finish_reason: Optional[str] = None,
+        max_new_tokens: Optional[int] = None,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
@@ -1493,7 +1594,6 @@ class TokenizerMetricsCollector:
                 labels_total = {**labels, "cache_source": "total"}
                 self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
 
-        self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
         self.histogram_e2e_request_latency.labels(**labels).observe(float(e2e_latency))
@@ -1507,6 +1607,8 @@ class TokenizerMetricsCollector:
         # vLLM-compatible request tokens histograms (always recorded)
         self.histogram_request_prompt_tokens.labels(**labels).observe(float(prompt_tokens))
         self.histogram_request_generation_tokens.labels(**labels).observe(float(generation_tokens))
+        if max_new_tokens is not None and max_new_tokens > 0:
+            self.histogram_request_params_max_tokens.labels(**labels).observe(float(max_new_tokens))
 
         # vLLM-compatible request timing histograms
         if inference_time is not None and inference_time > 0:
@@ -1515,6 +1617,11 @@ class TokenizerMetricsCollector:
             self.histogram_prefill_time_request.labels(**labels).observe(prefill_time)
         if decode_time is not None and decode_time > 0:
             self.histogram_decode_time_request.labels(**labels).observe(decode_time)
+
+        # Per-request TPOT: decode_time / (generation_tokens - 1)
+        if decode_time is not None and decode_time > 0 and generation_tokens > 1:
+            mean_tpot = decode_time / (generation_tokens - 1)
+            self.histogram_request_time_per_output_token.labels(**labels).observe(mean_tpot)
 
         # vLLM-compatible request_success counter
         # Map finish reason to vLLM-compatible values: stop, length, abort, error

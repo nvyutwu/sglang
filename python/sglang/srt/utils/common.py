@@ -1628,7 +1628,9 @@ class RefCountedGauge:
 
 
 def add_prometheus_track_response_middleware(app):
-    from prometheus_client import Counter, Gauge
+    import time as _time
+
+    from prometheus_client import Counter, Gauge, Histogram
 
     http_request_counter = Counter(
         name="http_requests_total",
@@ -1647,6 +1649,13 @@ def add_prometheus_track_response_middleware(app):
         documentation="Number of currently active HTTP requests",
         labelnames=["endpoint", "method"],
         multiprocess_mode="livesum",
+    )
+
+    http_request_duration = Histogram(
+        name="http_request_duration_seconds",
+        documentation="Histogram of HTTP request duration in seconds",
+        labelnames=["endpoint", "method"],
+        buckets=[0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 30.0, 60.0, 120.0],
     )
 
     routing_keys_active = RefCountedGauge(
@@ -1670,6 +1679,7 @@ def add_prometheus_track_response_middleware(app):
         if routing_key:
             routing_keys_active.inc(routing_key)
 
+        start_time = _time.time()
         try:
             response = await call_next(request)
 
@@ -1681,6 +1691,10 @@ def add_prometheus_track_response_middleware(app):
 
             return response
         finally:
+            duration = _time.time() - start_time
+            http_request_duration.labels(endpoint=path, method=method).observe(
+                duration
+            )
             http_requests_active.labels(endpoint=path, method=method).dec()
             if routing_key:
                 routing_keys_active.dec(routing_key)

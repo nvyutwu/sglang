@@ -40,8 +40,8 @@ def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
         response.raise_for_status()
 
         # Parse Prometheus text format
-        # Looking for: sglang:cached_tokens_total{...} <value>
-        #              sglang:prompt_tokens_total{...} <value>
+        # Looking for: cached_tokens_total{...} <value>
+        #              prompt_tokens_total{...} <value>
         cached_tokens_total = 0.0
         prompt_tokens_total = 0.0
 
