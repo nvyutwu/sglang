@@ -924,6 +924,13 @@ class SchedulerMetricsCollector:
         if server_args is None:
             return
 
+        # Get GPU type
+        try:
+            import torch
+            gpu_type = torch.cuda.get_device_name(0)
+        except Exception:
+            gpu_type = "unknown"
+
         # Model config info
         model_config_labels = {
             **self.labels,
@@ -932,6 +939,7 @@ class SchedulerMetricsCollector:
             "dtype": str(server_args.dtype),
             "max_total_tokens": str(server_args.max_total_tokens or "auto"),
             "quantization": str(server_args.quantization or "none"),
+            "gpu_type": gpu_type,
         }
         model_config_info = Gauge(
             name="model_config_info",
@@ -942,12 +950,14 @@ class SchedulerMetricsCollector:
         model_config_info.labels(**model_config_labels).set(1)
 
         # Parallel config info
+        gpu_count = server_args.tp_size * server_args.pp_size
         parallel_config_labels = {
             **self.labels,
             "tensor_parallel_size": str(server_args.tp_size),
             "pipeline_parallel_size": str(server_args.pp_size),
             "data_parallel_size": str(server_args.dp_size),
             "expert_parallel_size": str(server_args.ep_size),
+            "gpu_count": str(gpu_count),
         }
         parallel_config_info = Gauge(
             name="parallel_config_info",
