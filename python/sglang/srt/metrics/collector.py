@@ -452,13 +452,7 @@ class SchedulerMetricsCollector:
         self.num_retracted_reqs_total = Counter(
             # The name is `requests` instead of `reqs` to avoid dup name error
             name="num_retracted_requests_total",
-            documentation="Total number of retracted requests.",
-            labelnames=labels.keys(),
-        )
-        # vLLM-compatible alias for retracted requests (preemptions)
-        self.num_preemptions_total = Counter(
-            name="num_preemptions_total",
-            documentation="Total number of preempted requests (vLLM-compatible).",
+            documentation="Total number of retracted (preempted) requests.",
             labelnames=labels.keys(),
         )
         self.num_retracted_input_tokens_total = Counter(
@@ -1062,8 +1056,6 @@ class SchedulerMetricsCollector:
         num_retracted_output_tokens: int,
     ) -> None:
         self.num_retracted_reqs_total.labels(**self.labels).inc(num_retracted_reqs)
-        # Also increment vLLM-compatible preemptions counter
-        self.num_preemptions_total.labels(**self.labels).inc(num_retracted_reqs)
         self.num_retracted_input_tokens_total.labels(**self.labels).inc(
             num_retracted_input_tokens
         )
