@@ -937,8 +937,11 @@ class SchedulerMetricsCollector:
             "model": str(server_args.model_path),
             "served_model_name": str(server_args.served_model_name or server_args.model_path),
             "dtype": str(server_args.dtype),
-            "max_total_tokens": str(server_args.max_total_tokens or "auto"),
+            "max_model_len": str(getattr(server_args, "context_length", None) or "auto"),
+            "max_total_tokens": str(getattr(server_args, "max_total_tokens", None) or "auto"),
+            "max_output_length": str(getattr(server_args, "max_output_length", None) or "auto"),
             "quantization": str(server_args.quantization or "none"),
+            "enforce_eager": str(getattr(server_args, "disable_cuda_graph", False)),
             "gpu_type": gpu_type,
         }
         model_config_info = Gauge(
@@ -985,6 +988,25 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
             speculative_config_info.labels(**speculative_config_labels).set(1)
+
+        # Detailed config info (scheduler, kernel backends, env settings)
+        detailed_config_labels = {
+            **self.labels,
+            "stream_interval": str(getattr(server_args, "stream_interval", 1)),
+            "attention_backend": str(getattr(server_args, "attention_backend", None) or "auto"),
+            "sampling_backend": str(getattr(server_args, "sampling_backend", None) or "auto"),
+            "grammar_backend": str(getattr(server_args, "grammar_backend", None) or "auto"),
+            "chunked_prefill_size": str(getattr(server_args, "chunked_prefill_size", None) or "auto"),
+            "schedule_policy": str(getattr(server_args, "schedule_policy", "fcfs")),
+        }
+        detailed_config_info = Gauge(
+            name="detailed_config_info",
+            documentation="Additional engine configuration details "
+            "(scheduler, kernel backends, env settings)",
+            labelnames=detailed_config_labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        detailed_config_info.labels(**detailed_config_labels).set(1)
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
