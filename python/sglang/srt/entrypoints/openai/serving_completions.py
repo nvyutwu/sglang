@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
     SglExt,
 )
+from sglang.srt.entrypoints.openai.request_metrics import classify_completion_request
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -83,6 +84,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             logprob_start_len = -1
 
         # Build sampling parameters
+        classify_completion_request(request)
         sampling_params = self._build_sampling_params(request)
 
         # Determine prompt format

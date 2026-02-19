@@ -59,59 +59,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 payload_logger = logging.getLogger("sglang.payload")
 
-# --- Request type counters ---
-from prometheus_client import Counter
-
-_request_type_image = Counter(
-    name="request_type_image_total",
-    documentation="Total chat completion requests containing images",
-)
-_request_type_video = Counter(
-    name="request_type_video_total",
-    documentation="Total chat completion requests containing videos",
-)
-_request_type_tool_call = Counter(
-    name="request_type_tool_call_total",
-    documentation="Total chat completion requests with tool calls enabled",
-)
-_request_type_structured_output = Counter(
-    name="request_type_structured_output_total",
-    documentation="Total chat completion requests with structured output "
-    "(json_schema, json_object, structural_tag, regex, or ebnf grammar)",
-)
-
-
-def _classify_chat_request(request: ChatCompletionRequest) -> None:
-    """Increment request type counters based on request content."""
-    has_image = False
-    has_video = False
-    for msg in request.messages or []:
-        content = getattr(msg, "content", None)
-        if isinstance(content, list):
-            for part in content:
-                part_type = (
-                    part.get("type", "") if isinstance(part, dict)
-                    else getattr(part, "type", "")
-                )
-                if part_type == "image_url":
-                    has_image = True
-                elif part_type == "video_url":
-                    has_video = True
-    if has_image:
-        _request_type_image.inc()
-    if has_video:
-        _request_type_video.inc()
-    if request.tools and request.tool_choice != "none":
-        _request_type_tool_call.inc()
-    if (
-        (request.response_format is not None
-         and hasattr(request.response_format, "type")
-         and request.response_format.type
-         in ("json_schema", "json_object", "structural_tag"))
-        or getattr(request, "regex", None) is not None
-        or getattr(request, "ebnf", None) is not None
-    ):
-        _request_type_structured_output.inc()
+# --- Request type classification (shared across all API endpoints) ---
+from sglang.srt.entrypoints.openai.request_metrics import classify_chat_request
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
@@ -307,7 +256,7 @@ class OpenAIServingChat(OpenAIServingBase):
             request.reasoning_effort = reasoning_effort
 
         """Convert OpenAI chat completion request to internal format"""
-        _classify_chat_request(request)
+        classify_chat_request(request)
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template

@@ -45,6 +45,7 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
+from sglang.srt.entrypoints.openai.request_metrics import classify_responses_request
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -181,6 +182,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     "payload": req_dump if req_dump is not None else None,
                 },
             )
+        classify_responses_request(request)
+
         # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
