@@ -992,6 +992,21 @@ class SchedulerMetricsCollector:
             "grammar_backend": str(getattr(server_args, "grammar_backend", None) or "auto"),
             "chunked_prefill_size": str(getattr(server_args, "chunked_prefill_size", None) or "auto"),
             "schedule_policy": str(getattr(server_args, "schedule_policy", "fcfs")),
+            # MOE backends
+            "moe_runner_backend": str(getattr(server_args, "moe_runner_backend", None) or "auto"),
+            "moe_a2a_backend": str(getattr(server_args, "moe_a2a_backend", None) or "none"),
+            # Phase-specific attention backends
+            "decode_attention_backend": str(getattr(server_args, "decode_attention_backend", None) or "auto"),
+            "prefill_attention_backend": str(getattr(server_args, "prefill_attention_backend", None) or "auto"),
+            # Quantization backends
+            "fp8_gemm_runner_backend": str(getattr(server_args, "fp8_gemm_runner_backend", None) or "auto"),
+            "fp4_gemm_runner_backend": str(getattr(server_args, "fp4_gemm_runner_backend", None) or "auto"),
+            # Compilation flags
+            "enable_torch_compile": str(getattr(server_args, "enable_torch_compile", False)),
+            "disable_cuda_graph": str(getattr(server_args, "disable_cuda_graph", False)),
+            "enable_piecewise_cuda_graph": str(getattr(server_args, "enable_piecewise_cuda_graph", False)),
+            # AO quantization
+            "torchao_config": str(getattr(server_args, "torchao_config", "") or "none"),
         }
         detailed_config_info = Gauge(
             name="detailed_config_info",
