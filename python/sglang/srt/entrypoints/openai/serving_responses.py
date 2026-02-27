@@ -169,6 +169,12 @@ class OpenAIServingResponses(OpenAIServingChat):
     ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
         # Optional request payload logging
         if os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1":
+            headers_obj = None
+            if raw_request is not None:
+                try:
+                    headers_obj = {k: v for k, v in raw_request.headers.items()}
+                except Exception:
+                    headers_obj = None
             try:
                 req_dump = request.model_dump()
             except Exception:
@@ -180,6 +186,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     "endpoint": "OpenAIServingResponses",
                     # Prefer structured JSON payload
                     "payload": req_dump if req_dump is not None else None,
+                    "headers": headers_obj,
                 },
             )
         classify_responses_request(request)
