@@ -59,6 +59,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 payload_logger = logging.getLogger("sglang.payload")
 
+# --- Request type classification (shared across all API endpoints) ---
+from sglang.srt.entrypoints.openai.request_metrics import classify_chat_request
+
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_vals = []
@@ -253,6 +256,7 @@ class OpenAIServingChat(OpenAIServingBase):
             request.reasoning_effort = reasoning_effort
 
         """Convert OpenAI chat completion request to internal format"""
+        classify_chat_request(request)
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template

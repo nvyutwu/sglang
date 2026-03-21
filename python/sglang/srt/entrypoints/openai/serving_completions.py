@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
@@ -16,6 +17,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
     SglExt,
 )
+from sglang.srt.entrypoints.openai.request_metrics import classify_completion_request
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -83,6 +85,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             logprob_start_len = -1
 
         # Build sampling parameters
+        classify_completion_request(request)
         sampling_params = self._build_sampling_params(request)
 
         # Determine prompt format
@@ -201,6 +204,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # State tracking for streaming
         stream_buffers = {}
         n_prev_tokens = {}
+        finish_reasons = {}
+        response_id = None
 
         # Usage tracking
         prompt_tokens = {}
@@ -276,6 +281,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 delta = text[len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
                 finish_reason = content["meta_info"]["finish_reason"]
+                if finish_reason:
+                    finish_reasons[index] = finish_reason
+                response_id = content["meta_info"]["id"]
 
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
@@ -370,6 +378,41 @@ class OpenAIServingCompletion(OpenAIServingBase):
         except Exception as e:
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+
+        # Log streaming response payload after completion
+        try:
+            if os.getenv("SGLANG_LOG_PAYLOADS", "0") == "1":
+                choices_list = []
+                for idx in sorted(stream_buffers.keys()):
+                    fr = finish_reasons.get(idx)
+                    choices_list.append({
+                        "index": idx,
+                        "text": stream_buffers[idx],
+                        "finish_reason": fr["type"] if fr else "stop",
+                    })
+                response_payload = {
+                    "id": response_id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": request.model,
+                    "choices": choices_list,
+                    "usage": {
+                        "prompt_tokens": sum(prompt_tokens.values()),
+                        "completion_tokens": sum(completion_tokens.values()),
+                        "total_tokens": sum(prompt_tokens.values()) + sum(completion_tokens.values()),
+                    },
+                    "stream": True,
+                }
+                logging.getLogger("sglang.payload").info(
+                    "openai.response",
+                    extra={
+                        "rid": response_id or "",
+                        "endpoint": self.__class__.__name__,
+                        "payload": response_payload,
+                    },
+                )
+        except Exception:
+            pass
 
         yield "data: [DONE]\n\n"
 

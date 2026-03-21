@@ -641,8 +641,106 @@ def get_otel_meter():
     return _GLOBAL_METER
 
 
+# Native Prometheus metrics that would conflict if the sglang_ prefix were stripped.
+# These are emitted by the prometheus_client Python library itself and would create
+# duplicate metric registrations if SGLang's sglang_process_* / sglang_python_*
+# metrics were also exposed without a prefix.
+_NATIVE_PROMETHEUS_METRICS: frozenset = frozenset({
+    "process_cpu_seconds_total",
+    "process_open_fds",
+    "process_max_fds",
+    "process_virtual_memory_bytes",
+    "process_resident_memory_bytes",
+    "process_start_time_seconds",
+    "python_gc_objects_collected_total",
+    "python_gc_objects_uncollectable_total",
+    "python_gc_collections_total",
+    "python_info",
+})
+
+# Explicit renames: SGLang Prometheus name (with sglang_ prefix) → unified OTel name.
+# Mirrors the _METRIC_NAME_MAP pattern used in vLLM's otel_instrumentation.py so both
+# frameworks emit identical metric names into the OTel/OTLP pipeline.
+_METRIC_NAME_MAP: Dict[str, str] = {
+    # Core latency histograms
+    "sglang_e2e_request_latency_seconds":           "e2e_request_latency_seconds",
+    "sglang_time_to_first_token_seconds":           "time_to_first_token_seconds",
+    "sglang_inter_token_latency_seconds":           "inter_token_latency_seconds",
+    "sglang_request_inference_time_seconds":        "request_inference_time_seconds",
+    "sglang_request_prefill_time_seconds":          "request_prefill_time_seconds",
+    "sglang_request_decode_time_seconds":           "request_decode_time_seconds",
+    "sglang_request_time_per_output_token_seconds": "request_time_per_output_token_seconds",
+    # Token counters
+    "sglang_prompt_tokens_total":                   "prompt_tokens_total",
+    "sglang_generation_tokens_total":               "generation_tokens_total",
+    # Token histograms
+    "sglang_request_prompt_tokens":                 "request_prompt_tokens",
+    "sglang_request_generation_tokens":             "request_generation_tokens",
+    # Request counters
+    "sglang_request_success_total":                 "request_success_total",
+    "sglang_num_retracted_requests_total":          "num_retracted_requests_total",
+    # Queue / load gauges (OSS source names → unified OTel names)
+    "sglang_num_running_reqs":                      "num_requests_running",
+    "sglang_token_usage":                           "kv_cache_usage_perc",
+    "sglang_num_queue_reqs":                        "num_requests_waiting",
+    "sglang_queue_time_seconds":                    "request_queue_time_seconds",
+    "sglang_gen_throughput":                        "gen_throughput",
+    # Request counters (continued)
+    "sglang_num_requests_total":                    "num_requests_total",
+    # Startup / config
+    "sglang_engine_startup_time":                   "engine_startup_time",
+    "sglang_engine_load_weights_time":              "engine_load_weights_time",
+    "sglang_model_config_info":                     "model_config_info",
+    "sglang_parallel_config_info":                  "parallel_config_info",
+    "sglang_speculative_config_info":               "speculative_config_info",
+    # Cache metrics
+    "sglang_cache_hit_rate":                        "cache_hit_rate",
+    "sglang_cached_tokens_total":                   "cached_tokens_total",
+    "sglang_mm_cache_queries":                      "mm_cache_queries_total",
+    "sglang_mm_cache_hits":                         "mm_cache_hits_total",
+    # Speculative decoding
+    "sglang_spec_accept_rate":                      "spec_accept_rate",
+    "sglang_spec_accept_length":                    "spec_accept_length",
+    "sglang_spec_decode_num_drafts":                "spec_decode_num_drafts_total",
+    "sglang_spec_decode_num_accepted_tokens_per_pos": "spec_decode_num_accepted_tokens_per_pos_total",
+    # LoRA
+    "sglang_lora_pool_utilization":                 "lora_pool_utilization",
+    # Request parameters
+    "sglang_request_params_max_tokens":             "request_params_max_tokens",
+    # Request type counters
+    "sglang_request_type_image_total":              "request_type_image_total",
+    "sglang_request_type_video_total":              "request_type_video_total",
+    "sglang_request_type_tool_call_total":          "request_type_tool_call_total",
+    "sglang_request_type_structured_output_total":  "request_type_structured_output_total",
+}
+
+
 def _sanitize_metric_name(name: str) -> str:
-    return name.replace(":", "_")
+    """Translate a Prometheus metric name to its unified OTel name.
+
+    Resolution order:
+    1. Sanitize Prometheus label-separator colons to underscores.
+    2. Explicit map lookup: if the name is in ``_METRIC_NAME_MAP``, return the
+       mapped value directly (handles both simple prefix-strip and renames that
+       add/change ``_total`` suffixes).
+    3. Default prefix strip: remove the ``sglang_`` prefix, UNLESS the resulting
+       name would shadow a native ``prometheus_client`` metric (e.g.
+       ``process_cpu_seconds_total``).  In that case keep the full name with the
+       ``sglang_`` prefix to avoid collisions.
+    4. Pass through unchanged for any other metric (non-sglang_ prefixed, or
+       already unprefixed).
+    """
+    name = name.replace(":", "_")
+    # Step 2 — explicit map
+    if name in _METRIC_NAME_MAP:
+        return _METRIC_NAME_MAP[name]
+    # Step 3 — default strip with native-metric guard
+    if name.startswith("sglang_"):
+        stripped = name[len("sglang_"):]
+        if stripped not in _NATIVE_PROMETHEUS_METRICS:
+            return stripped
+        # Would conflict with a native Prometheus metric — keep the sglang_ prefix
+    return name
 
 
 def _labels_to_attributes(labels: Dict[str, str]) -> Dict[str, str]:

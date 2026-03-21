@@ -372,6 +372,27 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.prefix_cache_queries = Counter(
+            name="sglang:prefix_cache_queries",
+            documentation="Prefix cache queries, in terms of number of queried tokens.",
+            labelnames=labels.keys(),
+        )
+        self.prefix_cache_hits = Counter(
+            name="sglang:prefix_cache_hits",
+            documentation="Prefix cache hits, in terms of number of cached tokens.",
+            labelnames=labels.keys(),
+        )
+
+        self.mm_cache_queries = Counter(
+            name="sglang:mm_cache_queries",
+            documentation="Multi-modal cache queries, in terms of number of queried items.",
+            labelnames=labels.keys(),
+        )
+        self.mm_cache_hits = Counter(
+            name="sglang:mm_cache_hits",
+            documentation="Multi-modal cache hits, in terms of number of cached items.",
+            labelnames=labels.keys(),
+        )
 
         self.max_total_num_tokens = Gauge(
             name="sglang:max_total_num_tokens",
@@ -393,6 +414,33 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+
+        self.spec_decode_num_drafts = Counter(
+            name="sglang:spec_decode_num_drafts",
+            documentation="Number of speculative decoding draft attempts.",
+            labelnames=labels.keys(),
+        )
+
+        # Determine number of speculative positions for per-position counter
+        if server_args is not None:
+            draft_tokens_fallback = (server_args.speculative_num_steps or 0) + 1
+            self.num_spec_positions = (
+                server_args.speculative_num_draft_tokens or draft_tokens_fallback
+            )
+        else:
+            self.num_spec_positions = 0
+
+        position_labels = {**labels, "position": ""}
+        self.spec_decode_num_accepted_tokens_per_pos = Counter(
+            name="sglang:spec_decode_num_accepted_tokens_per_pos",
+            documentation="Accepted tokens per draft position.",
+            labelnames=position_labels.keys(),
+        )
+        # Pre-create per-position counters
+        for pos in range(self.num_spec_positions):
+            self.spec_decode_num_accepted_tokens_per_pos.labels(
+                **labels, position=str(pos)
+            )
 
         # Retract
         # TODO maybe remove this old gauge in favor of the new counter
@@ -859,6 +907,116 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        # Config info gauges (for PromQL joins with performance metrics)
+        # These are set once at startup and don't change
+        self._log_config_info(server_args)
+
+    def _log_config_info(self, server_args: Optional["ServerArgs"]) -> None:
+        """Log config info gauges for PromQL correlation with performance metrics."""
+        from prometheus_client import Gauge
+
+        if server_args is None:
+            return
+
+        # Get GPU type
+        try:
+            import torch
+            gpu_type = torch.cuda.get_device_name(0)
+        except Exception:
+            gpu_type = "unknown"
+
+        # Model config info
+        model_config_labels = {
+            **self.labels,
+            "model": str(server_args.model_path),
+            "served_model_name": str(server_args.served_model_name or server_args.model_path),
+            "dtype": str(server_args.dtype),
+            "max_model_len": str(getattr(server_args, "context_length", None) or "auto"),
+            "max_total_tokens": str(getattr(server_args, "max_total_tokens", None) or "auto"),
+            "max_output_length": str(getattr(server_args, "max_output_length", None) or "auto"),
+            "quantization": str(server_args.quantization or "none"),
+            "enforce_eager": str(getattr(server_args, "disable_cuda_graph", False)),
+            "gpu_type": gpu_type,
+        }
+        model_config_info = Gauge(
+            name="sglang:model_config_info",
+            documentation="Information of the engine ModelConfig",
+            labelnames=model_config_labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        model_config_info.labels(**model_config_labels).set(1)
+
+        # Parallel config info
+        gpu_count = server_args.tp_size * server_args.pp_size
+        parallel_config_labels = {
+            **self.labels,
+            "tensor_parallel_size": str(server_args.tp_size),
+            "pipeline_parallel_size": str(server_args.pp_size),
+            "data_parallel_size": str(server_args.dp_size),
+            "expert_parallel_size": str(server_args.ep_size),
+            "gpu_count": str(gpu_count),
+        }
+        parallel_config_info = Gauge(
+            name="sglang:parallel_config_info",
+            documentation="Information of the engine ParallelConfig",
+            labelnames=parallel_config_labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        parallel_config_info.labels(**parallel_config_labels).set(1)
+
+        # Speculative config info (only if speculative decoding is enabled)
+        if server_args.speculative_algorithm is not None:
+            speculative_config_labels = {
+                **self.labels,
+                "spec_enabled": "true",
+                "spec_algorithm": str(server_args.speculative_algorithm),
+                "spec_num_draft_tokens": str(server_args.speculative_num_draft_tokens or 0),
+                "spec_num_steps": str(server_args.speculative_num_steps or 0),
+                "spec_eagle_topk": str(server_args.speculative_eagle_topk or 0),
+                "spec_draft_model": str(server_args.speculative_draft_model_path or "none"),
+            }
+            speculative_config_info = Gauge(
+                name="sglang:speculative_config_info",
+                documentation="Information of the engine SpeculativeConfig",
+                labelnames=speculative_config_labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            speculative_config_info.labels(**speculative_config_labels).set(1)
+
+        # Detailed config info (scheduler, kernel backends, env settings)
+        detailed_config_labels = {
+            **self.labels,
+            "stream_interval": str(getattr(server_args, "stream_interval", 1)),
+            "attention_backend": str(getattr(server_args, "attention_backend", None) or "auto"),
+            "sampling_backend": str(getattr(server_args, "sampling_backend", None) or "auto"),
+            "grammar_backend": str(getattr(server_args, "grammar_backend", None) or "auto"),
+            "chunked_prefill_size": str(getattr(server_args, "chunked_prefill_size", None) or "auto"),
+            "schedule_policy": str(getattr(server_args, "schedule_policy", "fcfs")),
+            # MOE backends
+            "moe_runner_backend": str(getattr(server_args, "moe_runner_backend", None) or "auto"),
+            "moe_a2a_backend": str(getattr(server_args, "moe_a2a_backend", None) or "none"),
+            # Phase-specific attention backends
+            "decode_attention_backend": str(getattr(server_args, "decode_attention_backend", None) or "auto"),
+            "prefill_attention_backend": str(getattr(server_args, "prefill_attention_backend", None) or "auto"),
+            # Quantization backends
+            "fp8_gemm_runner_backend": str(getattr(server_args, "fp8_gemm_runner_backend", None) or "auto"),
+            "fp4_gemm_runner_backend": str(getattr(server_args, "fp4_gemm_runner_backend", None) or "auto"),
+            # Compilation flags
+            "enable_torch_compile": str(getattr(server_args, "enable_torch_compile", False)),
+            "disable_cuda_graph": str(getattr(server_args, "disable_cuda_graph", False)),
+            "enable_piecewise_cuda_graph": str(getattr(server_args, "enable_piecewise_cuda_graph", False)),
+            # AO quantization
+            "torchao_config": str(getattr(server_args, "torchao_config", "") or "none"),
+        }
+        detailed_config_info = Gauge(
+            name="sglang:detailed_config_info",
+            documentation="Additional engine configuration details "
+            "(scheduler, kernel backends, env settings)",
+            labelnames=detailed_config_labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        detailed_config_info.labels(**detailed_config_labels).set(1)
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -931,6 +1089,46 @@ class SchedulerMetricsCollector:
         self.eplb_balancedness.labels(**self.labels, forward_mode=forward_mode).observe(
             balancedness
         )
+
+    def increment_spec_decode_counters(
+        self, num_drafts: int, accept_lengths_per_req: list
+    ) -> None:
+        """Increment speculative decoding counters (vLLM-compatible).
+
+        Args:
+            num_drafts: Number of draft attempts (= batch size).
+            accept_lengths_per_req: Per-request accepted draft token counts.
+        """
+        self.spec_decode_num_drafts.labels(**self.labels).inc(num_drafts)
+        for accepted in accept_lengths_per_req:
+            for pos in range(accepted):
+                self.spec_decode_num_accepted_tokens_per_pos.labels(
+                    **self.labels, position=str(pos)
+                ).inc(1)
+
+    def increment_prefix_cache_counters(
+        self, queries: int, hits: int
+    ) -> None:
+        """Increment prefix cache counters (vLLM-compatible).
+
+        Args:
+            queries: Total tokens queried against the prefix cache
+                     (= log_input_tokens + log_hit_tokens).
+            hits: Tokens served from the prefix cache (= log_hit_tokens).
+        """
+        if queries > 0:
+            self.prefix_cache_queries.labels(**self.labels).inc(queries)
+        if hits > 0:
+            self.prefix_cache_hits.labels(**self.labels).inc(hits)
+
+    def increment_mm_cache_counters(
+        self, queries: int, hits: int
+    ) -> None:
+        """Increment multi-modal cache counters (vLLM-compatible)."""
+        if queries > 0:
+            self.mm_cache_queries.labels(**self.labels).inc(queries)
+        if hits > 0:
+            self.mm_cache_hits.labels(**self.labels).inc(hits)
 
     def increment_realtime_tokens(
         self,
@@ -1183,6 +1381,13 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        # vLLM-compatible request_success counter with finished_reason label
+        self.request_success_total = Counter(
+            name="sglang:request_success_total",
+            documentation="Count of successfully processed requests by finish reason.",
+            labelnames=list(labels.keys()) + ["finished_reason"],
+        )
+
         if bucket_time_to_first_token is None:
             bucket_time_to_first_token = [
                 0.1,
@@ -1307,6 +1512,89 @@ class TokenizerMetricsCollector:
             ],
         )
 
+        # vLLM-compatible request timing histograms
+        request_latency_buckets = [
+            0.3,
+            0.5,
+            0.8,
+            1.0,
+            1.5,
+            2.0,
+            2.5,
+            5.0,
+            10.0,
+            15.0,
+            20.0,
+            30.0,
+            40.0,
+            50.0,
+            60.0,
+            120.0,
+            240.0,
+            480.0,
+            960.0,
+            1920.0,
+            3840.0,
+            7680.0,
+        ]
+
+        self.histogram_inference_time_request = Histogram(
+            name="sglang:request_inference_time_seconds",
+            documentation="Histogram of time spent in inference (forward) phase for request.",
+            labelnames=labels.keys(),
+            buckets=request_latency_buckets,
+        )
+
+        self.histogram_prefill_time_request = Histogram(
+            name="sglang:request_prefill_time_seconds",
+            documentation="Histogram of time spent in prefill phase for request.",
+            labelnames=labels.keys(),
+            buckets=request_latency_buckets,
+        )
+
+        self.histogram_decode_time_request = Histogram(
+            name="sglang:request_decode_time_seconds",
+            documentation="Histogram of time spent in decode phase for request.",
+            labelnames=labels.keys(),
+            buckets=request_latency_buckets,
+        )
+
+        tpot_buckets = [
+            0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5,
+            0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0, 40.0, 80.0,
+        ]
+        self.histogram_request_time_per_output_token = Histogram(
+            name="sglang:request_time_per_output_token_seconds",
+            documentation="Histogram of time per output token per request.",
+            labelnames=labels.keys(),
+            buckets=tpot_buckets,
+        )
+
+        # vLLM-compatible request tokens histograms (always created)
+        request_tokens_buckets = [
+            1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000
+        ]
+        self.histogram_request_prompt_tokens = Histogram(
+            name="sglang:request_prompt_tokens",
+            documentation="Histogram of prompt tokens per request.",
+            labelnames=labels.keys(),
+            buckets=request_tokens_buckets,
+        )
+
+        self.histogram_request_generation_tokens = Histogram(
+            name="sglang:request_generation_tokens",
+            documentation="Histogram of generation tokens per request.",
+            labelnames=labels.keys(),
+            buckets=request_tokens_buckets,
+        )
+
+        self.histogram_request_params_max_tokens = Histogram(
+            name="sglang:request_params_max_tokens",
+            documentation="Histogram of the max_tokens request parameter.",
+            labelnames=labels.keys(),
+            buckets=request_tokens_buckets,
+        )
+
     def observe_one_finished_request(
         self,
         labels: Dict[str, str],
@@ -1317,9 +1605,15 @@ class TokenizerMetricsCollector:
         has_grammar: bool,
         retraction_count: int,
         cached_tokens_details: Optional[Dict[str, Any]] = None,
+        inference_time: Optional[float] = None,
+        prefill_time: Optional[float] = None,
+        decode_time: Optional[float] = None,
+        finish_reason: Optional[str] = None,
+        max_new_tokens: Optional[int] = None,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
+        self.num_requests_total.labels(**labels).inc(1)
 
         # Report cached tokens with detailed source breakdown
         if cached_tokens > 0:
@@ -1346,7 +1640,6 @@ class TokenizerMetricsCollector:
                 labels_total = {**labels, "cache_source": "total"}
                 self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
 
-        self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
         self.histogram_e2e_request_latency.labels(**labels).observe(float(e2e_latency))
@@ -1356,6 +1649,30 @@ class TokenizerMetricsCollector:
                 float(generation_tokens)
             )
         self.num_retractions.labels(**labels).observe(retraction_count)
+
+        # vLLM-compatible request tokens histograms (always recorded)
+        self.histogram_request_prompt_tokens.labels(**labels).observe(float(prompt_tokens))
+        self.histogram_request_generation_tokens.labels(**labels).observe(float(generation_tokens))
+        if max_new_tokens is not None and max_new_tokens > 0:
+            self.histogram_request_params_max_tokens.labels(**labels).observe(float(max_new_tokens))
+
+        # vLLM-compatible request timing histograms
+        if inference_time is not None and inference_time > 0:
+            self.histogram_inference_time_request.labels(**labels).observe(inference_time)
+        if prefill_time is not None and prefill_time > 0:
+            self.histogram_prefill_time_request.labels(**labels).observe(prefill_time)
+        if decode_time is not None and decode_time > 0:
+            self.histogram_decode_time_request.labels(**labels).observe(decode_time)
+
+        # Per-request TPOT: decode_time / (generation_tokens - 1)
+        if decode_time is not None and decode_time > 0 and generation_tokens > 1:
+            mean_tpot = decode_time / (generation_tokens - 1)
+            self.histogram_request_time_per_output_token.labels(**labels).observe(mean_tpot)
+
+        # vLLM-compatible request_success counter
+        # Map finish reason to vLLM-compatible values: stop, length, abort, error
+        reason_str = finish_reason or "stop"
+        self.request_success_total.labels(**labels, finished_reason=reason_str).inc(1)
 
     def observe_time_to_first_token(self, labels: Dict[str, str], value: float):
         self.histogram_time_to_first_token.labels(**labels).observe(value)

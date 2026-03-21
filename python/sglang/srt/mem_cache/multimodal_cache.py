@@ -87,6 +87,15 @@ class MultiModalStaticCache(MultimodalCache):
         self.max_size = max_size
         self.mm_cache: OrderedDict[int, EmbeddingResult] = OrderedDict()
         self.current_size = 0
+        # Cache hit tracking (drain-and-reset pattern)
+        self._queries = 0
+        self._hits = 0
+
+    def drain_stats(self) -> tuple:
+        """Return (queries, hits) since last drain and reset counters."""
+        queries, hits = self._queries, self._hits
+        self._queries = self._hits = 0
+        return queries, hits
 
     def get(
         self, mm_hashes: List[int], combined_hash: Optional[int] = None
@@ -94,8 +103,10 @@ class MultiModalStaticCache(MultimodalCache):
         combined_hash = self.combine_hashes(mm_hashes)
         # MultiModalStaticCache does not fallback to individual item lookup
 
+        self._queries += 1
         embedding = self.mm_cache.get(combined_hash)
         if embedding is not None:
+            self._hits += 1
             self.mm_cache.move_to_end(combined_hash)
         return embedding
 
