@@ -927,6 +927,8 @@ class MHATokenToKVPool(KVCache):
             self._get_value_buffer(i)[0].nbytes * self.page_size
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
+        from sglang.srt.debug_utils import kv_fingerprint
+        kv_fingerprint.register_kv_pool(self)
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_cpu_copy(self, indices):
@@ -1523,6 +1525,8 @@ class MLATokenToKVPool(KVCache):
         kv_item_lens = [
             self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
         ]
+        from sglang.srt.debug_utils import kv_fingerprint
+        kv_fingerprint.register_kv_pool(self)
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_key_buffer(self, layer_id: int):
@@ -1958,6 +1962,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         item_lens = [
             self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
         ]
+        from sglang.srt.debug_utils import kv_fingerprint
+        kv_fingerprint.register_state_pool(self)
         return data_ptrs, data_lens, item_lens
 
     def get_kv_size_bytes(self):
