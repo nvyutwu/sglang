@@ -173,9 +173,17 @@ class NixlKVManager(CommonKVManager):
             ) from e
 
         backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
+        # NOTE: upstream PR #17654 sets num_threads=0 on the decode side as an
+        # "optimization." On Blackwell+aarch64 (GB200) the synchronous
+        # nixl_agent() constructor on the decode side then deadlocks waiting
+        # for a UCX progress thread that never gets one — pure SGLang's
+        # `launch_server --disaggregation-mode decode` hangs forever before
+        # logging "NIXL KVManager initialized". Restore the pre-PR behavior
+        # (num_threads=8 on both sides) until upstream offers a less invasive
+        # fix.
         agent_config = nixl_agent_config(
             backends=[backend],
-            num_threads=(8 if disaggregation_mode == DisaggregationMode.PREFILL else 0),
+            num_threads=8,
         )
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
 
