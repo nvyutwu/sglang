@@ -281,6 +281,89 @@ _NSA_IMPL_T: TypeAlias = Literal[
 ]
 
 
+# Track which (req_pool_idx, layer, page) tuples have already been
+# fingerprinted so each page is logged exactly once on first read. Lives
+# at module scope (per-process) since a single decode worker owns one
+# attention backend instance.
+_FP_SEEN_PAGES: set = set()
+
+
+def _emit_first_read_fingerprints(forward_batch, layer) -> None:
+    """Hook C: log a fingerprint for each ``(rpi, layer, page)`` tuple
+    the first time NSA's ``forward_decode`` reads it.
+
+    Module-level so the hot path inside ``forward_decode`` is one
+    ``if`` + one call. Reads pages back via the registered KV pool /
+    NSA state pool to avoid raw GPU pointer arithmetic.
+    """
+    import time
+
+    from sglang.srt.debug_utils import kv_fingerprint
+
+    layer_id = getattr(layer, "layer_id", -1)
+    rti = getattr(forward_batch, "req_to_token_pool", None)
+    if rti is None:
+        return
+    try:
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        kv_pool = kv_fingerprint.get_kv_pool()
+        state_pool = kv_fingerprint.get_state_pool()
+        kv_start_layer = (
+            getattr(kv_pool, "start_layer", 0) or 0 if kv_pool is not None else 0
+        )
+        for bi in range(req_pool_indices.shape[0]):
+            rpi = int(req_pool_indices[bi].item())
+            sl = int(seq_lens[bi].item())
+            if sl <= 0:
+                continue
+            pages = (
+                rti.req_to_token[rpi, :sl].detach().cpu().numpy().tolist()
+            )
+            fresh: List[int] = []
+            seen = _FP_SEEN_PAGES
+            for p in set(pages):
+                key = (rpi, layer_id, int(p))
+                if key in seen:
+                    continue
+                seen.add(key)
+                fresh.append(int(p))
+            if not fresh:
+                continue
+            t_ns = time.time_ns()
+            if kv_pool is not None:
+                try:
+                    buf = kv_pool.get_key_buffer(layer_id + kv_start_layer)
+                    fps = kv_fingerprint.batch_page_fingerprints(buf, fresh)
+                    for p, fp in zip(fresh, fps):
+                        kv_fingerprint.log({
+                            "ev": "read", "role": kv_fingerprint.role(),
+                            "rank": kv_fingerprint.rank(), "rpi": rpi,
+                            "layer": layer_id, "page": p, "is_state": 0,
+                            "fp": fp, "t_ns": t_ns,
+                        })
+                except Exception:
+                    pass
+            if state_pool is not None:
+                try:
+                    buf = state_pool.index_k_with_scale_buffer[layer_id]
+                    fps = kv_fingerprint.batch_page_fingerprints(buf, fresh)
+                    for p, fp in zip(fresh, fps):
+                        kv_fingerprint.log({
+                            "ev": "read", "role": kv_fingerprint.role(),
+                            "rank": kv_fingerprint.rank(), "rpi": rpi,
+                            "layer": layer_id, "page": p, "is_state": 1,
+                            "fp": fp, "t_ns": t_ns,
+                        })
+                except Exception:
+                    pass
+    except Exception as e:  # pragma: no cover — never throw from a debug hook
+        kv_fingerprint.log({
+            "ev": "_hook_err", "where": "first_read",
+            "err": repr(e), "t_ns": time.time_ns(),
+        })
+
+
 class NativeSparseAttnBackend(
     NativeSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
 ):
@@ -1478,6 +1561,20 @@ class NativeSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+
+        # Hook C — fingerprint each KV / NSA-state page on its first read
+        # by this layer for this request. Discriminates decode-side block
+        # aliasing (B != C) from NIXL transport corruption (A != B) and
+        # NSA index drift (all match but output broken). Skipped during
+        # cuda-graph capture/replay to avoid graph poisoning.
+        from sglang.srt.debug_utils import kv_fingerprint
+        if kv_fingerprint.is_enabled():
+            in_cg = (
+                getattr(forward_batch, "is_cuda_graph", False)
+                or getattr(forward_batch, "capturing_cuda_graph", False)
+            )
+            if not in_cg:
+                _emit_first_read_fingerprints(forward_batch, layer)
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
