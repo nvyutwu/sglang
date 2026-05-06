@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.debug_utils import kv_fingerprint
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
@@ -30,6 +31,114 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 GUARD = "NixlMsgGuard".encode("ascii")
+
+
+def _emit_send_fingerprints(
+    notif: str,
+    peer_name: str,
+    prefill_data_indices: npt.NDArray[np.int32],
+    dst_data_indices: npt.NDArray[np.int32],
+) -> None:
+    """Hook A: log a fingerprint for every page about to cross NIXL.
+
+    Layered as a module-level helper so the hot path in
+    ``_send_kvcache_generic`` stays one ``if`` + one call.
+    """
+    try:
+        room, kind, chunk_id, is_last, pp_rank = kv_fingerprint.parse_notif(notif)
+        is_state = 1 if kind == "state" else 0
+        pool = (
+            kv_fingerprint.get_state_pool() if is_state
+            else kv_fingerprint.get_kv_pool()
+        )
+        if pool is None:
+            kv_fingerprint.log({
+                "ev": "send_no_pool", "room": room, "kind": kind,
+                "n_pages": len(prefill_data_indices), "t_ns": time.time_ns(),
+            })
+            return
+        src_pages = list(map(int, prefill_data_indices))
+        dst_pages = list(map(int, dst_data_indices))
+        layer_num = getattr(pool, "layer_num", 0)
+        start_layer = getattr(pool, "start_layer", 0) or 0
+        t_ns = time.time_ns()
+        for li in range(layer_num):
+            try:
+                if is_state:
+                    buf = pool.index_k_with_scale_buffer[li]
+                else:
+                    buf = pool.get_key_buffer(li + start_layer)
+            except Exception:
+                continue
+            fps = kv_fingerprint.batch_page_fingerprints(buf, src_pages)
+            for sp, dp, fp in zip(src_pages, dst_pages, fps):
+                kv_fingerprint.log({
+                    "ev": "send", "role": kv_fingerprint.role(),
+                    "rank": kv_fingerprint.rank(), "room": room,
+                    "kind": kind, "chunk": chunk_id,
+                    "is_last": int(is_last), "is_state": is_state,
+                    "layer": li, "src_page": sp, "dst_page": dp,
+                    "peer": peer_name, "fp": fp, "t_ns": t_ns,
+                })
+    except Exception as e:  # pragma: no cover — debug hook must never throw
+        kv_fingerprint.log({
+            "ev": "_hook_err", "where": "send", "err": repr(e),
+            "t_ns": time.time_ns(),
+        })
+
+
+def _emit_recv_fingerprints(
+    room: int,
+    kv_indices: Optional[List[int]],
+    state_indices: Optional[List[int]],
+) -> None:
+    """Hook B: log a fingerprint per received page, the instant the
+    receiver transitions to ``KVPoll.Success`` for this room.
+
+    Compared against ``send`` rows in post-processing to detect NIXL
+    transport corruption (A != B). Comparing against ``read`` rows
+    later detects decode-side bookkeeping (B != C).
+    """
+    try:
+        t_ns = time.time_ns()
+        kv_pool = kv_fingerprint.get_kv_pool()
+        state_pool = kv_fingerprint.get_state_pool()
+        if kv_pool is not None and kv_indices:
+            layer_num = getattr(kv_pool, "layer_num", 0)
+            start_layer = getattr(kv_pool, "start_layer", 0) or 0
+            for li in range(layer_num):
+                try:
+                    buf = kv_pool.get_key_buffer(li + start_layer)
+                except Exception:
+                    continue
+                fps = kv_fingerprint.batch_page_fingerprints(buf, kv_indices)
+                for dp, fp in zip(kv_indices, fps):
+                    kv_fingerprint.log({
+                        "ev": "recv", "role": kv_fingerprint.role(),
+                        "rank": kv_fingerprint.rank(), "room": room,
+                        "kind": "kv", "is_state": 0, "layer": li,
+                        "dst_page": dp, "fp": fp, "t_ns": t_ns,
+                    })
+        if state_pool is not None and state_indices:
+            layer_num = getattr(state_pool, "layer_num", 0)
+            for li in range(layer_num):
+                try:
+                    buf = state_pool.index_k_with_scale_buffer[li]
+                except Exception:
+                    continue
+                fps = kv_fingerprint.batch_page_fingerprints(buf, state_indices)
+                for dp, fp in zip(state_indices, fps):
+                    kv_fingerprint.log({
+                        "ev": "recv", "role": kv_fingerprint.role(),
+                        "rank": kv_fingerprint.rank(), "room": room,
+                        "kind": "state", "is_state": 1, "layer": li,
+                        "dst_page": dp, "fp": fp, "t_ns": t_ns,
+                    })
+    except Exception as e:  # pragma: no cover
+        kv_fingerprint.log({
+            "ev": "_hook_err", "where": "recv", "room": room,
+            "err": repr(e), "t_ns": time.time_ns(),
+        })
 
 
 @dataclasses.dataclass
@@ -163,6 +272,11 @@ class NixlKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        # Wire up the debug fingerprint logger as soon as the disagg
+        # manager is constructed; init() is a no-op when the env var is
+        # unset, and idempotent across the prefill/decode workers that
+        # both end up calling it.
+        kv_fingerprint.init(role=str(disaggregation_mode).split(".")[-1].lower())
         try:
             from nixl._api import nixl_agent, nixl_agent_config
         except ImportError as e:
@@ -444,6 +558,16 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
+        # Hook A — fingerprint each src page just before NIXL submit, so
+        # we can later compare against fingerprint B (recv-side) and
+        # fingerprint C (decode first-read). See debug_utils/kv_fingerprint.py.
+        if kv_fingerprint.is_enabled():
+            _emit_send_fingerprints(
+                notif=notif,
+                peer_name=peer_name,
+                prefill_data_indices=prefill_data_indices,
+                dst_data_indices=dst_data_indices,
+            )
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
@@ -982,6 +1106,14 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
+        # Hook B (stash): the receiver will need these page indices when
+        # the transfer completes — see poll() below.
+        if kv_fingerprint.is_enabled():
+            self._fp_kv_indices = list(map(int, kv_indices))
+            self._fp_state_indices = (
+                list(map(int, state_indices)) if state_indices is not None
+                else None
+            )
         if self.bootstrap_infos is None:
             logger.error(
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
@@ -1059,6 +1191,17 @@ class NixlKVReceiver(CommonKVReceiver):
                 )
             else:
                 self.conclude_state = KVPoll.Success
+                # Hook B: transfer completed cleanly — fingerprint each
+                # received page on the decode side, before any other code
+                # path can write to the pool. See _emit_recv_fingerprints
+                # near the top of the file.
+                if kv_fingerprint.is_enabled() and not getattr(self, "_fp_recvd", False):
+                    self._fp_recvd = True
+                    _emit_recv_fingerprints(
+                        room=self.bootstrap_room,
+                        kv_indices=getattr(self, "_fp_kv_indices", None),
+                        state_indices=getattr(self, "_fp_state_indices", None),
+                    )
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
