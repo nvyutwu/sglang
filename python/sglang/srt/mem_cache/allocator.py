@@ -28,6 +28,40 @@ import triton.language as tl
 
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
+# Hook D — debug-only KV-page alloc/free timeline. No-op unless
+# SGLANG_DEBUG_KV_FINGERPRINT=1. The post-processor walks the resulting
+# JSONL events to detect double-allocation of the same physical page
+# without an intervening free (the H1' aliasing smoking gun).
+def _log_alloc_free(op: str, page_ids) -> None:
+    from sglang.srt.debug_utils import kv_fingerprint
+    if not kv_fingerprint.is_enabled():
+        return
+    try:
+        import time
+        try:
+            ids_list = page_ids.detach().cpu().tolist()
+        except AttributeError:
+            ids_list = list(page_ids)
+        # Cap per-event payload to keep individual lines small; full
+        # length is preserved in the n field.
+        if len(ids_list) > 256:
+            ids_sample = ids_list[:128] + ids_list[-128:]
+            sampled = True
+        else:
+            ids_sample = ids_list
+            sampled = False
+        kv_fingerprint.log({
+            "ev": op, "role": kv_fingerprint.role(),
+            "rank": kv_fingerprint.rank(), "n": len(ids_list),
+            "ids": ids_sample, "sampled": sampled, "t_ns": time.time_ns(),
+        })
+    except Exception as e:  # pragma: no cover
+        kv_fingerprint.log({
+            "ev": "_hook_err", "where": f"alloc_{op}",
+            "err": repr(e), "t_ns": __import__("time").time_ns(),
+        })
+
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
@@ -150,6 +184,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
+        _log_alloc_free("alloc", select_index)
         return select_index
 
     def free(self, free_index: torch.Tensor):
@@ -163,6 +198,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.free_pages = torch.cat((self.free_pages, free_index))
         else:
             self.free_group.append(free_index)
+        _log_alloc_free("free", free_index)
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)
@@ -397,7 +433,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             out_pages[:, None] * self.page_size
             + torch.arange(self.page_size, device=self.device)
         ).reshape(-1)
-
+        _log_alloc_free("alloc", out_pages)
         return out_indices
 
     def alloc_extend(
@@ -445,7 +481,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        new_pages = self.free_pages[:num_new_pages]
         self.free_pages = self.free_pages[num_new_pages:]
+        _log_alloc_free("alloc", new_pages)
         return out_indices
 
     def alloc_decode(
@@ -484,7 +522,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        new_pages = self.free_pages[:num_new_pages]
         self.free_pages = self.free_pages[num_new_pages:]
+        _log_alloc_free("alloc", new_pages)
         return out_indices
 
     def free(self, free_index: torch.Tensor):
@@ -497,6 +537,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
                 self.free_pages = torch.cat((free_page_indices, self.free_pages))
+            _log_alloc_free("free", free_page_indices)
         else:
             self.free_group.append(free_index)
 
