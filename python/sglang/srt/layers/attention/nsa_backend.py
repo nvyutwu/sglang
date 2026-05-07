@@ -1566,14 +1566,15 @@ class NativeSparseAttnBackend(
         # by this layer for this request. Discriminates decode-side block
         # aliasing (B != C) from NIXL transport corruption (A != B) and
         # NSA index drift (all match but output broken). Skipped during
-        # cuda-graph capture/replay to avoid graph poisoning.
+        # cuda-graph capture (the host-blocking .cpu() copies would be
+        # baked into the captured stream); allowed during replay since
+        # the broken c=8 sustained workload runs in non-graph mode.
         from sglang.srt.debug_utils import kv_fingerprint
         if kv_fingerprint.is_enabled():
-            in_cg = (
-                getattr(forward_batch, "is_cuda_graph", False)
-                or getattr(forward_batch, "capturing_cuda_graph", False)
+            from sglang.srt.model_executor.cuda_graph_runner import (
+                get_is_capture_mode,
             )
-            if not in_cg:
+            if not get_is_capture_mode():
                 _emit_first_read_fingerprints(forward_batch, layer)
 
         causal = not layer.is_cross_attention
