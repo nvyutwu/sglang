@@ -1966,6 +1966,135 @@ class NSATokenToKVPool(MLATokenToKVPool):
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
 
+    # ------------------------------------------------------------------
+    # CPU offload of the NSA K-indexer state (``index_k_with_scale_buffer``)
+    #
+    # The MLA base class only round-trips ``kv_buffer`` across retract→resume.
+    # In disagg-decode, on-decode-side retract calls ``Req.offload_kv_cache``
+    # which dumps ``kv_buffer`` to host memory and frees the GPU pages; on
+    # resume the bytes are copied back into the new pages. The NSA index
+    # buffer was previously left out of this round-trip — after resume the
+    # new pages carried whatever the previous owner had written, so the NSA
+    # decode-side sparse-index lookups (``get_index_k_with_scale_buffer``)
+    # read stale state for the prefix tokens. That mismatch is
+    # H6'-via-retract on the long-CoT gibberish ablation.
+    #
+    # We override ``get_cpu_copy`` / ``load_cpu_copy`` here (rather than
+    # plumbing a separate API through ``Req``) so any caller that already
+    # round-trips the MLA buffer automatically picks up the NSA state too.
+    # The payload becomes a dict ``{"kv": <super result>, "state": <per-layer
+    # per-token K + scale slices>}`` so it remains a single ``del``-able
+    # attribute on ``Req``. Mirrors the SWA pool convention.
+    # ------------------------------------------------------------------
+
+    def _gather_state_per_token(
+        self, layer_id: int, indices: torch.Tensor
+    ) -> tuple:
+        """Gather per-token (K bytes, scale bytes) slices from one layer's
+        index_k_with_scale_buffer for the given absolute token indices.
+
+        The buffer is page-major: ``buf[page, :page_size*head_dim]`` is fp8
+        K data laid out as ``page_size`` consecutive ``head_dim``-byte
+        blocks, and ``buf[page, page_size*head_dim:]`` is ``page_size``
+        consecutive 4-byte fp32 scales (stored as uint8 here).
+        """
+        buf = self.index_k_with_scale_buffer[layer_id]
+        head_dim = self.index_head_dim
+        page_size = self.page_size
+        row_size = buf.shape[1]
+        k_region_size = page_size * head_dim
+        device = buf.device
+
+        pages = (indices // page_size).to(torch.int64)
+        offsets = (indices % page_size).to(torch.int64)
+
+        flat = buf.view(-1)
+        k_starts = pages * row_size + offsets * head_dim
+        s_starts = pages * row_size + k_region_size + offsets * 4
+
+        hd_range = torch.arange(head_dim, device=device, dtype=torch.int64)
+        sd_range = torch.arange(4, device=device, dtype=torch.int64)
+        k_idx = k_starts.unsqueeze(1) + hd_range.unsqueeze(0)
+        s_idx = s_starts.unsqueeze(1) + sd_range.unsqueeze(0)
+
+        return flat[k_idx], flat[s_idx]
+
+    def _scatter_state_per_token(
+        self,
+        layer_id: int,
+        indices: torch.Tensor,
+        k_bytes: torch.Tensor,
+        s_bytes: torch.Tensor,
+    ) -> None:
+        buf = self.index_k_with_scale_buffer[layer_id]
+        head_dim = self.index_head_dim
+        page_size = self.page_size
+        row_size = buf.shape[1]
+        k_region_size = page_size * head_dim
+        device = buf.device
+
+        pages = (indices // page_size).to(torch.int64)
+        offsets = (indices % page_size).to(torch.int64)
+
+        flat = buf.view(-1)
+        k_starts = pages * row_size + offsets * head_dim
+        s_starts = pages * row_size + k_region_size + offsets * 4
+
+        hd_range = torch.arange(head_dim, device=device, dtype=torch.int64)
+        sd_range = torch.arange(4, device=device, dtype=torch.int64)
+        k_idx = k_starts.unsqueeze(1) + hd_range.unsqueeze(0)
+        s_idx = s_starts.unsqueeze(1) + sd_range.unsqueeze(0)
+
+        flat[k_idx] = k_bytes
+        flat[s_idx] = s_bytes
+
+    def get_cpu_copy(self, indices):
+        kv_cpu = super().get_cpu_copy(indices)
+        torch.cuda.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        state_cpu = []
+        for layer_id in range(self.layer_num):
+            state_cpu.append([])
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_dev, s_dev = self._gather_state_per_token(layer_id, chunk_indices)
+                k_cpu = k_dev.to("cpu", non_blocking=True)
+                s_cpu = s_dev.to("cpu", non_blocking=True)
+                state_cpu[-1].append((k_cpu, s_cpu))
+        torch.cuda.synchronize()
+        return {"kv": kv_cpu, "state": state_cpu}
+
+    def load_cpu_copy(self, cpu_copy, indices):
+        if isinstance(cpu_copy, dict):
+            kv_cpu = cpu_copy["kv"]
+            state_cpu = cpu_copy["state"]
+        else:
+            # Backward compat: payload from a non-NSA snapshot. Treat as
+            # KV-only and skip the state restore (will be recomputed by
+            # whatever path produced it).
+            kv_cpu = cpu_copy
+            state_cpu = None
+
+        super().load_cpu_copy(kv_cpu, indices)
+
+        if state_cpu is None:
+            return
+
+        torch.cuda.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        device = self.index_k_with_scale_buffer[0].device
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_cpu, s_cpu = state_cpu[layer_id][i // chunk_size]
+                assert k_cpu.shape[0] == len(chunk_indices)
+                k_dev = k_cpu.to(device, non_blocking=True)
+                s_dev = s_cpu.to(device, non_blocking=True)
+                self._scatter_state_per_token(
+                    layer_id, chunk_indices, k_dev, s_dev
+                )
+        torch.cuda.synchronize()
+
 
 class DoubleSparseTokenToKVPool(KVCache):
     def __init__(
