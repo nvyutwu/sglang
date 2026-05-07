@@ -504,6 +504,20 @@ class DecodePreallocQueue:
             # load from cpu, release the cpu copy
             req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
+            from sglang.srt.debug_utils import kv_fingerprint as _fp
+            if _fp.is_enabled():
+                _fp.emit_resume(
+                    rid=getattr(req, "rid", ""),
+                    rpi=int(getattr(req, "req_pool_idx", -1) or -1),
+                    gen_idx=len(getattr(req, "output_ids", []) or []),
+                    n_tokens=len(getattr(req, "origin_input_ids", []) or [])
+                             + len(getattr(req, "output_ids", []) or []),
+                    extra={
+                        "recovery_path": "load_kv_cache",
+                        "required_tokens": int(required_tokens_for_request),
+                    },
+                )
+
         self.retracted_queue = [
             entry
             for i, entry in enumerate(self.retracted_queue)

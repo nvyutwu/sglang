@@ -2604,7 +2604,37 @@ class Scheduler(
                 )
             logger.warning(msg_prefix + msg_details)
 
+            from sglang.srt.debug_utils import kv_fingerprint as _fp
+            _fp_enabled = _fp.is_enabled()
+            if _fp_enabled:
+                pool_total = (
+                    self.token_to_kv_pool_allocator.size
+                    if hasattr(self.token_to_kv_pool_allocator, "size")
+                    else -1
+                )
+                pool_used = (
+                    pool_total - new_available_tokens
+                    if pool_total > 0 else -1
+                )
+                pool_usage = (
+                    float(pool_used) / float(pool_total)
+                    if pool_total > 0 else -1.0
+                )
             for req in retracted_reqs:
+                if _fp_enabled:
+                    _fp.emit_retract(
+                        rid=getattr(req, "rid", ""),
+                        rpi=int(getattr(req, "req_pool_idx", -1) or -1),
+                        gen_idx=len(getattr(req, "output_ids", []) or []),
+                        n_tokens=len(getattr(req, "origin_input_ids", []) or [])
+                                 + len(getattr(req, "output_ids", []) or []),
+                        pool_usage=pool_usage,
+                        extra={
+                            "kv_full_retract": bool(kv_full_retract_flag),
+                            "n_retracted": len(retracted_reqs),
+                            "new_token_ratio": float(new_token_ratio),
+                        },
+                    )
                 self._add_request_to_queue(req, is_retracted=True)
                 if self.enable_hisparse:
                     self.hisparse_coordinator.retract_req(req)

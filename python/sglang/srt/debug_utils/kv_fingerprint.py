@@ -351,6 +351,180 @@ def kv_pool_tokens_per_page(pool) -> int:
 # NIXL notif parser
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Retract/resume + KV snapshot helpers
+#
+# In SGLang disagg, retract→resume on the decode side is NOT re-prefill via
+# NIXL — it is a CPU↔GPU memcpy. ``offload_kv_cache`` saves the seq's KV
+# bytes (MLA ``kv_buffer`` only — NSA ``index_k_with_scale_buffer`` is
+# never touched), then slots are freed; ``load_kv_cache`` allocates fresh
+# slots, writes the saved CPU bytes back. Hooks A (NIXL send) and B (NIXL
+# recv) do not fire on this path. Without an explicit pre-offload /
+# post-load snapshot, the post-processor cannot tell H1' (block contents
+# wrong) from H2' (req_to_token wrong) from H6' (NSA index stale) on
+# resumed sequences. These helpers close that gap.
+# ---------------------------------------------------------------------------
+
+
+def emit_retract(
+    rid: str,
+    rpi: int = -1,
+    gen_idx: int = -1,
+    n_tokens: int = -1,
+    pool_usage: float = -1.0,
+    extra: Optional[dict] = None,
+) -> None:
+    """Scheduler-side retract event. Fires per req returned by retract_decode."""
+    if not is_enabled():
+        return
+    ev = {
+        "ev": "retract",
+        "rid": rid, "rpi": rpi,
+        "gen_idx": gen_idx, "n_tokens": n_tokens,
+        "pool_usage": pool_usage,
+        "t_ns": time.time_ns(),
+    }
+    if extra:
+        ev.update(extra)
+    log(ev)
+
+
+def emit_resume(
+    rid: str,
+    rpi: int = -1,
+    gen_idx: int = -1,
+    n_tokens: int = -1,
+    extra: Optional[dict] = None,
+) -> None:
+    """Disagg decode-side resume event. Fires per req in resume_retracted_reqs."""
+    if not is_enabled():
+        return
+    ev = {
+        "ev": "resume",
+        "rid": rid, "rpi": rpi,
+        "gen_idx": gen_idx, "n_tokens": n_tokens,
+        "t_ns": time.time_ns(),
+    }
+    if extra:
+        ev.update(extra)
+    log(ev)
+
+
+def req_to_token_fp(token_indices) -> str:
+    """blake2b-8 over an int array. Use to detect when ``req_to_token``
+    changes between reads (a resume rewrites the row), or to confirm
+    pre-offload vs post-load slot-id maps differ as expected."""
+    try:
+        if hasattr(token_indices, "detach"):
+            arr = token_indices.detach().cpu().numpy()
+        else:
+            import numpy as np
+            arr = np.asarray(token_indices)
+        return hashlib.blake2b(arr.tobytes(), digest_size=8).hexdigest()
+    except Exception as e:
+        return f"err:{type(e).__name__}"
+
+
+def snapshot_seq_pages(
+    rid: str,
+    token_indices,
+    *,
+    rpi: int = -1,
+    label: str = "snap",
+    extra: Optional[dict] = None,
+) -> None:
+    """Fingerprint every (layer, page) for a sequence's KV+state buffers.
+
+    ``token_indices`` is the seq's slot list (typically
+    ``req_to_token[rpi, :seq_len]``). Page IDs are derived via floor-div
+    by ``page_size``. Fingerprints both ``kv_buffer`` (token-major) and
+    ``index_k_with_scale_buffer`` (page-major) when their pools are
+    registered. Each fingerprint event carries ``label`` so the
+    post-processor can pair the same page across pre-offload /
+    post-load / first-read snapshots.
+
+    This is the only path that exercises the NSA state buffer at the
+    retract→resume boundary — the SGLang offload/load path doesn't touch
+    it, so post-load fp != pre-offload fp on the state channel is the
+    H6'-via-retract smoking gun.
+    """
+    if not is_enabled():
+        return
+    kv_pool = get_kv_pool()
+    state_pool = get_state_pool()
+    if kv_pool is None and state_pool is None:
+        return
+    try:
+        if hasattr(token_indices, "detach"):
+            slots = token_indices.detach().cpu().numpy().tolist()
+        else:
+            slots = list(token_indices)
+        if not slots:
+            return
+        page_size = (
+            kv_pool_tokens_per_page(kv_pool)
+            if kv_pool is not None
+            else kv_pool_tokens_per_page(state_pool)
+        )
+        pages = sorted({int(s) // max(1, page_size) for s in slots})
+    except Exception as e:
+        log({
+            "ev": "_snap_err", "label": label, "rid": rid, "rpi": rpi,
+            "err": f"{type(e).__name__}: {e}", "t_ns": time.time_ns(),
+        })
+        return
+
+    n_pages = len(pages)
+    t_ns = time.time_ns()
+    base = {
+        "ev": "snap", "label": label, "rid": rid, "rpi": rpi,
+        "n_slots": len(slots), "n_pages": n_pages,
+    }
+    if extra:
+        base.update(extra)
+
+    if kv_pool is not None:
+        kv_start = getattr(kv_pool, "start_layer", 0) or 0
+        layer_num = getattr(kv_pool, "layer_num", 0)
+        tpp = kv_pool_tokens_per_page(kv_pool)
+        for li in range(layer_num):
+            layer_id = li + kv_start
+            try:
+                buf = kv_pool.get_key_buffer(layer_id)
+            except Exception:
+                continue
+            fps = batch_page_fingerprints(buf, pages, tokens_per_page=tpp)
+            for p, fp in zip(pages, fps):
+                ev = dict(base)
+                ev.update({
+                    "channel": "kv", "layer": layer_id,
+                    "page": int(p), "fp": fp, "t_ns": t_ns,
+                })
+                log(ev)
+
+    if state_pool is not None:
+        state_start = getattr(state_pool, "start_layer", 0) or 0
+        state_layer_num = getattr(state_pool, "layer_num", 0)
+        for li in range(state_layer_num):
+            layer_id = li + state_start
+            try:
+                buf = state_pool.index_k_with_scale_buffer[layer_id - state_start]
+            except Exception:
+                continue
+            fps = batch_page_fingerprints(buf, pages, tokens_per_page=1)
+            for p, fp in zip(pages, fps):
+                ev = dict(base)
+                ev.update({
+                    "channel": "state", "layer": layer_id,
+                    "page": int(p), "fp": fp, "t_ns": t_ns,
+                })
+                log(ev)
+
+
+# ---------------------------------------------------------------------------
+# NIXL notif parser
+# ---------------------------------------------------------------------------
+
 def parse_notif(notif: str):
     """Parse the NIXL notification string emitted by the disagg KV manager.
 
