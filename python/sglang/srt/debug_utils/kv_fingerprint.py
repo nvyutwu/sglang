@@ -356,7 +356,13 @@ def parse_notif(notif: str):
 
     ``"{room}_kv_{chunk}_{is_last}_{pp}"``  (main KV channel)
     ``"{room}_state_{pp}"``                 (NSA state channel)
-    ``"{room}_aux_{pp}"``                   (aux metadata)
+    ``"{room}_aux"``                        (aux metadata; no pp suffix)
+
+    Note: aux notifs do NOT carry the pp_rank suffix in the current
+    NIXL conn.py emit path (``send_aux`` sends ``f"{room}_aux"``); the
+    helper falls back to ``pp_rank=0`` for them. They never reach the
+    fingerprint hook regardless — ``_emit_send_fingerprints`` is only
+    called from ``_send_kvcache_generic``, not from ``send_aux``.
 
     Returns ``(room: int, kind: str, chunk_id: int, is_last: bool, pp_rank: int)``.
     Falls back to a permissive parse on unexpected formats.
