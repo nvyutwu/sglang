@@ -42,19 +42,31 @@ def _log_alloc_free(op: str, page_ids) -> None:
             ids_list = page_ids.detach().cpu().tolist()
         except AttributeError:
             ids_list = list(page_ids)
-        # Cap per-event payload to keep individual lines small; full
-        # length is preserved in the n field.
-        if len(ids_list) > 256:
-            ids_sample = ids_list[:128] + ids_list[-128:]
-            sampled = True
-        else:
-            ids_sample = ids_list
-            sampled = False
-        kv_fingerprint.log({
-            "ev": op, "role": kv_fingerprint.role(),
-            "rank": kv_fingerprint.rank(), "n": len(ids_list),
-            "ids": ids_sample, "sampled": sampled, "t_ns": time.time_ns(),
-        })
+        # The post-processor walks ev["ids"] to detect double-allocation
+        # without an intervening free (the H1' aliasing smoking gun);
+        # truncating the payload would silently drop the very page that
+        # proves the bug. Emit the full list, splitting across multiple
+        # events when it exceeds the per-line chunk size to keep
+        # individual JSONL lines under ~32 KB at 8 B/int.
+        n_total = len(ids_list)
+        t_ns = time.time_ns()
+        chunk = 4096
+        if n_total <= chunk:
+            kv_fingerprint.log({
+                "ev": op, "role": kv_fingerprint.role(),
+                "rank": kv_fingerprint.rank(), "n": n_total,
+                "ids": ids_list, "t_ns": t_ns,
+            })
+            return
+        n_chunks = (n_total + chunk - 1) // chunk
+        for ci in range(n_chunks):
+            sl = ids_list[ci * chunk : (ci + 1) * chunk]
+            kv_fingerprint.log({
+                "ev": op, "role": kv_fingerprint.role(),
+                "rank": kv_fingerprint.rank(), "n": n_total,
+                "ids": sl, "chunk_index": ci, "chunk_count": n_chunks,
+                "t_ns": t_ns,
+            })
     except Exception as e:  # pragma: no cover
         kv_fingerprint.log({
             "ev": "_hook_err", "where": f"alloc_{op}",
