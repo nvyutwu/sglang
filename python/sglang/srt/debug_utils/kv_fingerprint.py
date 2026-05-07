@@ -225,11 +225,23 @@ def get_state_pool():
 # vanishingly small false-match rate (~2^-64 per page-pair).
 # ---------------------------------------------------------------------------
 
-def page_fingerprint(buf, page_idx: int) -> str:
-    """Single-page fingerprint. Returns hex string or ``"err:<exc>"``."""
+def page_fingerprint(buf, page_idx: int, tokens_per_page: int = 1) -> str:
+    """Single-page fingerprint. Returns hex string or ``"err:<exc>"``.
+
+    ``tokens_per_page`` is the buffer's row-to-page ratio:
+      * ``1`` for page-major buffers (NSA ``index_k_with_scale_buffer``)
+      * ``page_size`` (typically 64) for token-major buffers
+        (``MHATokenToKVPool.k_buffer``, ``MLATokenToKVPool.kv_buffer``)
+    """
     try:
         import torch
-        page = buf[int(page_idx)].contiguous().view(torch.uint8)
+        p = int(page_idx)
+        if tokens_per_page <= 1:
+            page = buf[p].contiguous().view(torch.uint8)
+        else:
+            start = p * tokens_per_page
+            end = start + tokens_per_page
+            page = buf[start:end].contiguous().view(torch.uint8)
         n = page.numel()
         sample = page if n <= 128 else torch.cat([page[:64], page[n - 64:]])
         arr = sample.detach().cpu().numpy().tobytes()
@@ -238,8 +250,15 @@ def page_fingerprint(buf, page_idx: int) -> str:
         return f"err:{type(e).__name__}"
 
 
-def batch_page_fingerprints(buf, page_ids) -> List[str]:
+def batch_page_fingerprints(
+    buf, page_ids, tokens_per_page: int = 1
+) -> List[str]:
     """Vectorized fingerprint for many pages with one D2H copy.
+
+    ``tokens_per_page`` selects the indexing convention:
+      * ``1`` — buffer first dim is num_pages; ``buf[i]`` is page ``i``.
+      * ``>1`` — buffer first dim is num_tokens; page ``i`` is rows
+        ``[i*tokens_per_page : (i+1)*tokens_per_page]``.
 
     Returns one hex string per ``page_ids`` entry, or one ``"err:<exc>"``
     string per entry on failure.
@@ -249,13 +268,31 @@ def batch_page_fingerprints(buf, page_ids) -> List[str]:
         n_pages = len(page_ids)
         if n_pages == 0:
             return []
-        idx = torch.as_tensor(page_ids, dtype=torch.long, device=buf.device)
-        sub = (
-            buf.index_select(0, idx)
-            .contiguous()
-            .view(n_pages, -1)
-            .view(torch.uint8)
-        )
+        if tokens_per_page <= 1:
+            idx = torch.as_tensor(
+                page_ids, dtype=torch.long, device=buf.device
+            )
+            sub = (
+                buf.index_select(0, idx)
+                .contiguous()
+                .view(n_pages, -1)
+                .view(torch.uint8)
+            )
+        else:
+            ids_arr = [int(p) for p in page_ids]
+            base = torch.as_tensor(
+                ids_arr, dtype=torch.long, device=buf.device
+            ) * tokens_per_page
+            offsets = torch.arange(
+                tokens_per_page, dtype=torch.long, device=buf.device
+            )
+            row_idx = (base[:, None] + offsets[None, :]).reshape(-1)
+            sub = (
+                buf.index_select(0, row_idx)
+                .contiguous()
+                .view(n_pages, -1)
+                .view(torch.uint8)
+            )
         n_bytes = sub.shape[1]
         if n_bytes <= 128:
             sample = sub
@@ -268,6 +305,17 @@ def batch_page_fingerprints(buf, page_ids) -> List[str]:
         ]
     except Exception as e:  # pragma: no cover
         return [f"err:{type(e).__name__}"] * len(page_ids)
+
+
+def kv_pool_tokens_per_page(pool) -> int:
+    """Resolve the row-to-page ratio for a registered KV pool.
+
+    NSA ``index_k_with_scale_buffer`` is page-major (rows == pages →
+    ratio 1). MLA ``kv_buffer`` and MHA ``k_buffer``/``v_buffer`` are
+    token-major: each page occupies ``page_size`` rows. Default of 1 is
+    safe — at worst we sample fewer bytes than expected.
+    """
+    return int(getattr(pool, "page_size", 1) or 1)
 
 
 # ---------------------------------------------------------------------------

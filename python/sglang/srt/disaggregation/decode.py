@@ -771,6 +771,19 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
+            # Debug-only: stash req_pool_idx + rid on the receiver so the
+            # NIXL recv-side fingerprint hook (Hook B) can emit them with
+            # each recv event. Lets the post-processor join recv (room) ↔
+            # read (rpi/rid) without collapsing across rooms (which under
+            # page reuse produced false-positive corruption matches).
+            from sglang.srt.debug_utils import kv_fingerprint as _fp
+            if _fp.is_enabled():
+                decode_req.kv_receiver._fp_rpi = int(
+                    decode_req.req.req_pool_idx
+                )
+                decode_req.kv_receiver._fp_rid = str(
+                    getattr(decode_req.req, "rid", "")
+                )
             decode_req.kv_receiver.send_metadata(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )

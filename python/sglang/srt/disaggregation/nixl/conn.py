@@ -61,6 +61,11 @@ def _emit_send_fingerprints(
         dst_pages = list(map(int, dst_data_indices))
         layer_num = getattr(pool, "layer_num", 0)
         start_layer = getattr(pool, "start_layer", 0) or 0
+        # NSA state buffer is page-major (one row per page); MLA/MHA KV
+        # buffer is token-major (page_size rows per page). The fingerprint
+        # helper needs the row-to-page ratio so it picks up the whole
+        # page, not a single token.
+        tokens_per_page = 1 if is_state else kv_fingerprint.kv_pool_tokens_per_page(pool)
         t_ns = time.time_ns()
         for li in range(layer_num):
             try:
@@ -70,14 +75,20 @@ def _emit_send_fingerprints(
                     buf = pool.get_key_buffer(li + start_layer)
             except Exception:
                 continue
-            fps = kv_fingerprint.batch_page_fingerprints(buf, src_pages)
+            fps = kv_fingerprint.batch_page_fingerprints(
+                buf, src_pages, tokens_per_page=tokens_per_page
+            )
+            # Emit GLOBAL layer IDs so B-vs-C joins line up under PP > 1.
+            # Both KV and state pools expose start_layer (NSA pool inherits
+            # from MLA); pool-local index ``li`` + start_layer is global.
+            global_layer = li + start_layer
             for sp, dp, fp in zip(src_pages, dst_pages, fps):
                 kv_fingerprint.log({
                     "ev": "send", "role": kv_fingerprint.role(),
                     "rank": kv_fingerprint.rank(), "room": room,
                     "kind": kind, "chunk": chunk_id,
                     "is_last": int(is_last), "is_state": is_state,
-                    "layer": li, "src_page": sp, "dst_page": dp,
+                    "layer": global_layer, "src_page": sp, "dst_page": dp,
                     "peer": peer_name, "fp": fp, "t_ns": t_ns,
                 })
     except Exception as e:  # pragma: no cover — debug hook must never throw
@@ -91,6 +102,8 @@ def _emit_recv_fingerprints(
     room: int,
     kv_indices: Optional[List[int]],
     state_indices: Optional[List[int]],
+    rpi: int = -1,
+    rid: str = "",
 ) -> None:
     """Hook B: log a fingerprint per received page, the instant the
     receiver transitions to ``KVPoll.Success`` for this room.
@@ -106,32 +119,45 @@ def _emit_recv_fingerprints(
         if kv_pool is not None and kv_indices:
             layer_num = getattr(kv_pool, "layer_num", 0)
             start_layer = getattr(kv_pool, "start_layer", 0) or 0
+            kv_tpp = kv_fingerprint.kv_pool_tokens_per_page(kv_pool)
             for li in range(layer_num):
                 try:
                     buf = kv_pool.get_key_buffer(li + start_layer)
                 except Exception:
                     continue
-                fps = kv_fingerprint.batch_page_fingerprints(buf, kv_indices)
+                fps = kv_fingerprint.batch_page_fingerprints(
+                    buf, kv_indices, tokens_per_page=kv_tpp
+                )
+                global_layer = li + start_layer
                 for dp, fp in zip(kv_indices, fps):
                     kv_fingerprint.log({
                         "ev": "recv", "role": kv_fingerprint.role(),
                         "rank": kv_fingerprint.rank(), "room": room,
-                        "kind": "kv", "is_state": 0, "layer": li,
+                        "rpi": rpi, "rid": rid,
+                        "kind": "kv", "is_state": 0,
+                        "layer": global_layer,
                         "dst_page": dp, "fp": fp, "t_ns": t_ns,
                     })
         if state_pool is not None and state_indices:
             layer_num = getattr(state_pool, "layer_num", 0)
+            state_start = getattr(state_pool, "start_layer", 0) or 0
             for li in range(layer_num):
                 try:
                     buf = state_pool.index_k_with_scale_buffer[li]
                 except Exception:
                     continue
-                fps = kv_fingerprint.batch_page_fingerprints(buf, state_indices)
+                # state buffer is page-major: tokens_per_page == 1.
+                fps = kv_fingerprint.batch_page_fingerprints(
+                    buf, state_indices, tokens_per_page=1
+                )
+                global_layer = li + state_start
                 for dp, fp in zip(state_indices, fps):
                     kv_fingerprint.log({
                         "ev": "recv", "role": kv_fingerprint.role(),
                         "rank": kv_fingerprint.rank(), "room": room,
-                        "kind": "state", "is_state": 1, "layer": li,
+                        "rpi": rpi, "rid": rid,
+                        "kind": "state", "is_state": 1,
+                        "layer": global_layer,
                         "dst_page": dp, "fp": fp, "t_ns": t_ns,
                     })
     except Exception as e:  # pragma: no cover
@@ -1201,6 +1227,8 @@ class NixlKVReceiver(CommonKVReceiver):
                         room=self.bootstrap_room,
                         kv_indices=getattr(self, "_fp_kv_indices", None),
                         state_indices=getattr(self, "_fp_state_indices", None),
+                        rpi=int(getattr(self, "_fp_rpi", -1)),
+                        rid=str(getattr(self, "_fp_rid", "")),
                     )
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore

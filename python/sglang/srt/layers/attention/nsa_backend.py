@@ -307,23 +307,37 @@ def _emit_first_read_fingerprints(forward_batch, layer) -> None:
     try:
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
+        rids = getattr(forward_batch, "rids", None) or []
         kv_pool = kv_fingerprint.get_kv_pool()
         state_pool = kv_fingerprint.get_state_pool()
-        kv_start_layer = (
-            getattr(kv_pool, "start_layer", 0) or 0 if kv_pool is not None else 0
+        # req_to_token stores PHYSICAL TOKEN SLOT indices (range
+        # [0, num_tokens)); a paged allocator hands out 64-token contiguous
+        # pages, so page_id = token_slot // page_size. Hooks A/B emit page
+        # IDs, so C must too — otherwise the post-processor's B-vs-C join
+        # is a namespace mismatch and silently empty.
+        page_size = (
+            kv_fingerprint.kv_pool_tokens_per_page(kv_pool)
+            if kv_pool is not None
+            else (kv_fingerprint.kv_pool_tokens_per_page(state_pool) if state_pool is not None else 1)
         )
         for bi in range(req_pool_indices.shape[0]):
             rpi = int(req_pool_indices[bi].item())
             sl = int(seq_lens[bi].item())
             if sl <= 0:
                 continue
-            pages = (
+            rid = rids[bi] if bi < len(rids) else f"rpi{rpi}"
+            token_slots = (
                 rti.req_to_token[rpi, :sl].detach().cpu().numpy().tolist()
             )
+            # Token slot → page ID (paged allocator: page = slot // page_size).
+            page_set = set(int(s) // max(1, page_size) for s in token_slots)
             fresh: List[int] = []
             seen = _FP_SEEN_PAGES
-            for p in set(pages):
-                key = (rpi, layer_id, int(p))
+            for p in page_set:
+                # Key on (rid, layer, page) — rid is unique per request, so
+                # rpi + page reuse across requests does not silently suppress
+                # legitimate first-read events.
+                key = (rid, layer_id, int(p))
                 if key in seen:
                     continue
                 seen.add(key)
@@ -333,12 +347,18 @@ def _emit_first_read_fingerprints(forward_batch, layer) -> None:
             t_ns = time.time_ns()
             if kv_pool is not None:
                 try:
-                    buf = kv_pool.get_key_buffer(layer_id + kv_start_layer)
-                    fps = kv_fingerprint.batch_page_fingerprints(buf, fresh)
+                    # NB: get_key_buffer takes the GLOBAL layer id and
+                    # subtracts start_layer internally; do NOT pre-add
+                    # start_layer here (that was a double-add bug).
+                    buf = kv_pool.get_key_buffer(layer_id)
+                    fps = kv_fingerprint.batch_page_fingerprints(
+                        buf, fresh, tokens_per_page=page_size
+                    )
                     for p, fp in zip(fresh, fps):
                         kv_fingerprint.log({
                             "ev": "read", "role": kv_fingerprint.role(),
                             "rank": kv_fingerprint.rank(), "rpi": rpi,
+                            "rid": rid,
                             "layer": layer_id, "page": p, "is_state": 0,
                             "fp": fp, "t_ns": t_ns,
                         })
@@ -346,12 +366,19 @@ def _emit_first_read_fingerprints(forward_batch, layer) -> None:
                     pass
             if state_pool is not None:
                 try:
-                    buf = state_pool.index_k_with_scale_buffer[layer_id]
-                    fps = kv_fingerprint.batch_page_fingerprints(buf, fresh)
+                    state_start = getattr(state_pool, "start_layer", 0) or 0
+                    buf = state_pool.index_k_with_scale_buffer[
+                        layer_id - state_start
+                    ]
+                    # state buffer is page-major: tokens_per_page == 1.
+                    fps = kv_fingerprint.batch_page_fingerprints(
+                        buf, fresh, tokens_per_page=1
+                    )
                     for p, fp in zip(fresh, fps):
                         kv_fingerprint.log({
                             "ev": "read", "role": kv_fingerprint.role(),
                             "rank": kv_fingerprint.rank(), "rpi": rpi,
+                            "rid": rid,
                             "layer": layer_id, "page": p, "is_state": 1,
                             "fp": fp, "t_ns": t_ns,
                         })
