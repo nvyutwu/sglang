@@ -64,8 +64,25 @@ def _encode(ev: dict) -> bytes:
     return (json.dumps(ev, separators=(",", ":")) + "\n").encode("ascii")
 
 
-def _drain_loop(path: Path) -> None:
+def _flush_dropped(f) -> None:
+    """Flush the residual ``_dropped`` counter to disk + reset to zero.
+
+    Called periodically (every 30 s in the steady-state loop) and once
+    more on shutdown so the final tail of dropped-event count is never
+    silently lost when the drain loop sees the sentinel and breaks.
+    """
     global _dropped
+    with _drop_lock:
+        if _dropped:
+            f.write(_encode({
+                "ev": "_dropped",
+                "n": _dropped,
+                "t_ns": time.time_ns(),
+            }))
+            _dropped = 0
+
+
+def _drain_loop(path: Path) -> None:
     last_drop_log = time.monotonic()
     with open(path, "ab", buffering=1 << 20) as f:
         while True:
@@ -73,13 +90,19 @@ def _drain_loop(path: Path) -> None:
             try:
                 ev = _q.get(timeout=1.0)  # type: ignore[union-attr]
                 if ev is None:
-                    break
+                    # Final flush before exiting: residual dropped count
+                    # must land on disk; the daemon thread is killed at
+                    # process exit and would otherwise lose the buffer.
+                    _flush_dropped(f)
+                    f.flush()
+                    return
                 batch.append(ev)
                 while len(batch) < _BATCH:
                     try:
                         ev = _q.get_nowait()  # type: ignore[union-attr]
                         if ev is None:
                             f.write(b"".join(_encode(x) for x in batch))
+                            _flush_dropped(f)
                             f.flush()
                             return
                         batch.append(ev)
@@ -91,14 +114,7 @@ def _drain_loop(path: Path) -> None:
                 f.write(b"".join(_encode(ev) for ev in batch))
             now = time.monotonic()
             if now - last_drop_log > 30.0:
-                with _drop_lock:
-                    if _dropped:
-                        f.write(_encode({
-                            "ev": "_dropped",
-                            "n": _dropped,
-                            "t_ns": time.time_ns(),
-                        }))
-                        _dropped = 0
+                _flush_dropped(f)
                 last_drop_log = now
 
 
@@ -147,12 +163,25 @@ def log(event: dict) -> None:
 
 
 def shutdown() -> None:
+    """Gracefully drain the queue + flush remaining buffered I/O.
+
+    The drain thread is daemon=True and would be killed at process exit
+    without flushing its 1 MB write buffer (~1 MB of tail events lost).
+    Use a blocking ``put`` with timeout so the sentinel always lands
+    even when the queue is at capacity. The drain loop performs the
+    final flush + writes residual ``_dropped`` count before returning.
+    """
     if not _started.is_set():
         return
     try:
-        _q.put_nowait(None)  # type: ignore[union-attr]
+        _q.put(None, block=True, timeout=5.0)  # type: ignore[union-attr]
     except queue.Full:
-        pass
+        # Queue still saturated after 5 s — give up on a clean exit but
+        # at least record the failure mode in stderr; the daemon thread
+        # will be killed at process exit losing the tail.
+        import sys
+        print("kv_fingerprint.shutdown: queue saturated; tail may be lost",
+              file=sys.stderr)
     if _thread is not None:
         _thread.join(timeout=10.0)
 
