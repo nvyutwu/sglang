@@ -20,11 +20,14 @@ person doesn't have to re-derive the analysis.
 > is a CPU↔GPU memcpy: `req.offload_kv_cache` saves the seq's MLA
 > `kv_buffer` bytes to a CPU buffer attached to the req, the slots are
 > freed, then `req.load_kv_cache` allocates fresh slots and writes the
-> CPU bytes back. **The NSA `index_k_with_scale_buffer` is never
-> offloaded/loaded** (NSATokenToKVPool inherits MLATokenToKVPool's
-> `get/load_cpu_copy` without override). Post-resume the new state-pool
-> pages contain whatever was at those page IDs from prior owners — the
-> direct H6'-via-retract surface.
+> CPU bytes back. ~~The NSA `index_k_with_scale_buffer` is never
+> offloaded/loaded~~ → **fixed on `feat/glm51-nsa-indexer-offload`**:
+> `NSATokenToKVPool.get_cpu_copy` / `load_cpu_copy` now round-trip the
+> per-token K + scale slices alongside the MLA `kv_buffer`, packed in a
+> `{"kv": ..., "state": ...}` dict (mirrors the SWA pool convention).
+> Post-resume state-pool pages no longer leak prior-owner bytes for the
+> retracted seq's tokens — collapsing the H6'-via-retract surface unless
+> the corruption lives in retract's allocator/remap path itself.
 >
 > Two of the deferred items below have been promoted to **fixed** as a
 > result; one remains deferred but is explicitly noted as the next

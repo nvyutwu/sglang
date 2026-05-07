@@ -1231,9 +1231,12 @@ class Req(ReqDllmMixin):
         # taken. The CPU bytes loaded back at resume should match these
         # fingerprints layer-for-layer, page-for-page; any mismatch on the
         # ``kv`` channel proves the offload/load path corrupted contents.
-        # The ``state`` channel (NSA index_k_with_scale_buffer) is not
-        # offloaded by SGLang at all, so its post-load fp will diverge from
-        # pre-offload — that divergence is the H6'-via-retract signal.
+        # The ``state`` channel (NSA index_k_with_scale_buffer) is now
+        # round-tripped by ``NSATokenToKVPool.get_cpu_copy`` /
+        # ``load_cpu_copy`` (this branch's offload patch), so a post-load
+        # state fp should now match the pre_offload state fp as well — any
+        # remaining divergence localizes the bug to H1'/H2' rather than
+        # H6'-via-retract.
         from sglang.srt.debug_utils import kv_fingerprint as _fp
         if _fp.is_enabled():
             _fp.snapshot_seq_pages(
@@ -1254,12 +1257,13 @@ class Req(ReqDllmMixin):
             self.req_pool_idx, : self.seqlen - 1
         ]
         token_to_kv_pool_allocator.load_cpu_copy(self.kv_cache_cpu, token_indices)
-        # Fingerprint AFTER load: the kv channel should now match the
-        # pre_offload snapshot (fidelity oracle for the CPU↔GPU copy).
-        # The state channel will likely differ from pre_offload — SGLang
-        # does not offload index_k_with_scale_buffer, so post-load state
-        # bytes are whatever was at the new GPU pages from prior owners
-        # (the H6'-via-retract surface).
+        # Fingerprint AFTER load: with NSA state offload enabled both the
+        # ``kv`` and ``state`` channels should now match the pre_offload
+        # snapshot. A residual ``state``-channel divergence here means the
+        # offload path itself dropped bytes; a divergence on a different
+        # subsequent fp (e.g. Hook C-narrow on topk_indices) with matching
+        # kv+state at this gate isolates the bug to per-step bookkeeping
+        # downstream of resume rather than to the resume copy itself.
         from sglang.srt.debug_utils import kv_fingerprint as _fp
         if _fp.is_enabled():
             _fp.snapshot_seq_pages(
