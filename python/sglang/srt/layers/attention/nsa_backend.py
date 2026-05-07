@@ -281,11 +281,16 @@ _NSA_IMPL_T: TypeAlias = Literal[
 ]
 
 
-# Track which (req_pool_idx, layer, page) tuples have already been
+# Track which (rid, layer, page) tuples have already been
 # fingerprinted so each page is logged exactly once on first read. Lives
 # at module scope (per-process) since a single decode worker owns one
 # attention backend instance.
 _FP_SEEN_PAGES: set = set()
+# Same dedup, but for the topk-narrow Hook C — fingerprints only the
+# pages NSA actually consults via topk_indices. Disjoint from the
+# superset hook because H6'-via-retract requires the narrow set to
+# expose the smoking gun (the surrounding pages always match recv-fp).
+_FP_SEEN_PAGES_TOPK: set = set()
 
 
 def _emit_first_read_fingerprints(forward_batch, layer) -> None:
@@ -326,9 +331,15 @@ def _emit_first_read_fingerprints(forward_batch, layer) -> None:
             if sl <= 0:
                 continue
             rid = rids[bi] if bi < len(rids) else f"rpi{rpi}"
-            token_slots = (
-                rti.req_to_token[rpi, :sl].detach().cpu().numpy().tolist()
-            )
+            slot_tensor = rti.req_to_token[rpi, :sl]
+            token_slots = slot_tensor.detach().cpu().numpy().tolist()
+            # Per-call fingerprint of the req_to_token slice so the
+            # post-processor can detect when the indirection table itself
+            # changes between reads (resume rewrites the row). Carrying it
+            # on every read event lets H1' (block contents wrong but rti
+            # stable) be distinguished from H2' (rti rewritten, block
+            # contents fine for whoever owns them now).
+            rti_fp = kv_fingerprint.req_to_token_fp(slot_tensor)
             # Token slot → page ID (paged allocator: page = slot // page_size).
             page_set = set(int(s) // max(1, page_size) for s in token_slots)
             fresh: List[int] = []
@@ -336,7 +347,8 @@ def _emit_first_read_fingerprints(forward_batch, layer) -> None:
             for p in page_set:
                 # Key on (rid, layer, page) — rid is unique per request, so
                 # rpi + page reuse across requests does not silently suppress
-                # legitimate first-read events.
+                # legitimate first-read events. After resume, NEW pages will
+                # naturally re-fire the hook (different page IDs).
                 key = (rid, layer_id, int(p))
                 if key in seen:
                     continue
@@ -360,7 +372,9 @@ def _emit_first_read_fingerprints(forward_batch, layer) -> None:
                             "rank": kv_fingerprint.rank(), "rpi": rpi,
                             "rid": rid,
                             "layer": layer_id, "page": p, "is_state": 0,
-                            "fp": fp, "t_ns": t_ns,
+                            "is_topk": 0,
+                            "fp": fp, "rti_fp": rti_fp, "seqlen": sl,
+                            "t_ns": t_ns,
                         })
                 except Exception:
                     pass
@@ -380,13 +394,145 @@ def _emit_first_read_fingerprints(forward_batch, layer) -> None:
                             "rank": kv_fingerprint.rank(), "rpi": rpi,
                             "rid": rid,
                             "layer": layer_id, "page": p, "is_state": 1,
-                            "fp": fp, "t_ns": t_ns,
+                            "is_topk": 0,
+                            "fp": fp, "rti_fp": rti_fp, "seqlen": sl,
+                            "t_ns": t_ns,
                         })
                 except Exception:
                     pass
     except Exception as e:  # pragma: no cover — never throw from a debug hook
         kv_fingerprint.log({
             "ev": "_hook_err", "where": "first_read",
+            "err": repr(e), "t_ns": time.time_ns(),
+        })
+
+
+def _emit_topk_read_fingerprints(
+    forward_batch,
+    layer,
+    physical_pages: Optional[torch.Tensor],
+) -> None:
+    """Hook C-narrow: log a fingerprint for each ``(rid, layer, page)``
+    tuple that NSA actually consults via topk page selection.
+
+    Distinct from the superset Hook C (``_emit_first_read_fingerprints``):
+    the superset captures every page in ``req_to_token[rpi, :seq_len]``
+    and would mask H6'-narrow (NSA picks the wrong page from a correct
+    page set) because the surrounding pages always match recv-fp. This
+    hook fingerprints only the pages NSA's indexer chose — a
+    B(recv) ≠ C-narrow(read) divergence, with the surrounding pages
+    intact, isolates the corruption to NSA's per-seq sparse-index state
+    (the H6'-via-retract surface).
+
+    ``physical_pages`` is a 2-D int tensor of resolved physical page IDs
+    that NSA will read from. Shape ``(num_tokens_padded, K)`` where K is
+    the topk count. Caller is responsible for resolving NSA position
+    indices → physical pages (via ``metadata.page_table_1`` gather, or
+    by passing the already-transformed ``page_table_1`` for non-trtllm
+    backends). ``-1`` entries are treated as padding and dropped.
+    """
+    import time
+
+    from sglang.srt.debug_utils import kv_fingerprint
+
+    if physical_pages is None:
+        return
+    layer_id = getattr(layer, "layer_id", -1)
+    try:
+        pp_cpu = physical_pages.detach().cpu().numpy()
+        rids = getattr(forward_batch, "rids", None) or []
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        kv_pool = kv_fingerprint.get_kv_pool()
+        state_pool = kv_fingerprint.get_state_pool()
+        page_size = (
+            kv_fingerprint.kv_pool_tokens_per_page(kv_pool)
+            if kv_pool is not None
+            else (
+                kv_fingerprint.kv_pool_tokens_per_page(state_pool)
+                if state_pool is not None else 1
+            )
+        )
+        bs = req_pool_indices.shape[0]
+        if bs == 0:
+            return
+        # physical_pages may be (B*verify_steps, K) for spec-decode, or
+        # (B, K) for plain decode. Split rows evenly across batch elements;
+        # if not divisible, skip narrow logging rather than mis-attribute.
+        total_rows = pp_cpu.shape[0]
+        if total_rows == 0:
+            return
+        if total_rows % bs != 0:
+            return
+        rows_per_seq = total_rows // bs
+        seen = _FP_SEEN_PAGES_TOPK
+        for bi in range(bs):
+            rpi = int(req_pool_indices[bi].item())
+            sl = int(seq_lens[bi].item())
+            if sl <= 0:
+                continue
+            rid = rids[bi] if bi < len(rids) else f"rpi{rpi}"
+            chunk = pp_cpu[bi * rows_per_seq : (bi + 1) * rows_per_seq]
+            # Drop sentinel -1 padding.
+            chunk = chunk[chunk >= 0]
+            if chunk.size == 0:
+                continue
+            # ``physical_pages`` carries resolved page IDs in the same
+            # namespace as Hooks A/B (recv emits) and the superset Hook C —
+            # the post-processor's B-vs-C-narrow join must therefore be on
+            # the same units. ``page_size`` here only selects the byte
+            # extraction stride for token-major buffers.
+            page_set = sorted({int(p) for p in chunk.tolist()})
+            fresh: List[int] = []
+            for p in page_set:
+                key = (rid, layer_id, int(p))
+                if key in seen:
+                    continue
+                seen.add(key)
+                fresh.append(int(p))
+            if not fresh:
+                continue
+            t_ns = time.time_ns()
+            if kv_pool is not None:
+                try:
+                    buf = kv_pool.get_key_buffer(layer_id)
+                    fps = kv_fingerprint.batch_page_fingerprints(
+                        buf, fresh, tokens_per_page=page_size
+                    )
+                    for p, fp in zip(fresh, fps):
+                        kv_fingerprint.log({
+                            "ev": "read", "role": kv_fingerprint.role(),
+                            "rank": kv_fingerprint.rank(), "rpi": rpi,
+                            "rid": rid,
+                            "layer": layer_id, "page": p, "is_state": 0,
+                            "is_topk": 1,
+                            "fp": fp, "seqlen": sl, "t_ns": t_ns,
+                        })
+                except Exception:
+                    pass
+            if state_pool is not None:
+                try:
+                    state_start = getattr(state_pool, "start_layer", 0) or 0
+                    buf = state_pool.index_k_with_scale_buffer[
+                        layer_id - state_start
+                    ]
+                    fps = kv_fingerprint.batch_page_fingerprints(
+                        buf, fresh, tokens_per_page=1
+                    )
+                    for p, fp in zip(fresh, fps):
+                        kv_fingerprint.log({
+                            "ev": "read", "role": kv_fingerprint.role(),
+                            "rank": kv_fingerprint.rank(), "rpi": rpi,
+                            "rid": rid,
+                            "layer": layer_id, "page": p, "is_state": 1,
+                            "is_topk": 1,
+                            "fp": fp, "seqlen": sl, "t_ns": t_ns,
+                        })
+                except Exception:
+                    pass
+    except Exception as e:  # pragma: no cover
+        kv_fingerprint.log({
+            "ev": "_hook_err", "where": "topk_read",
             "err": repr(e), "t_ns": time.time_ns(),
         })
 
@@ -1609,6 +1755,37 @@ class NativeSparseAttnBackend(
         assert causal, "NSA is causal only"
 
         if self.nsa_decode_impl == "trtllm":
+            # Hook C-narrow (trtllm path): NSA passes raw position
+            # ``topk_indices`` into the kernel which does an internal
+            # ``metadata.page_table_1[bi, topk_indices[bi]]`` lookup.
+            # Resolve to physical pages here so the narrow fingerprint
+            # set matches the Hook A/B (recv) namespace.
+            if (
+                kv_fingerprint.is_enabled()
+                and topk_indices is not None
+                and metadata.page_table_1 is not None
+            ):
+                from sglang.srt.model_executor.cuda_graph_runner import (
+                    get_is_capture_mode,
+                )
+                if not get_is_capture_mode():
+                    try:
+                        # Pad to match qo rows (mirrors the lookup the
+                        # kernel does internally).
+                        ti = self._pad_topk_indices(
+                            topk_indices, metadata.page_table_1.shape[0]
+                        )
+                        idx = ti.clamp(min=0).long()
+                        phys = metadata.page_table_1.gather(1, idx)
+                        # Re-stamp -1 sentinel rows so the hook drops them.
+                        phys = torch.where(ti < 0, ti.to(phys.dtype), phys)
+                        _emit_topk_read_fingerprints(forward_batch, layer, phys)
+                    except Exception as _e:
+                        import time as _t
+                        kv_fingerprint.log({
+                            "ev": "_hook_err", "where": "topk_pre_trtllm",
+                            "err": repr(_e), "t_ns": _t.time_ns(),
+                        })
             return self._forward_trtllm(
                 q,
                 k,
@@ -1671,6 +1848,18 @@ class NativeSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
+
+        # Hook C-narrow (non-trtllm decode paths): page_table_1 here is
+        # already the resolved per-request physical page selection NSA
+        # will hand to the attention kernel. Fingerprint just those pages
+        # so a B-vs-C-narrow divergence localizes to the NSA topk path
+        # (H6'-via-retract).
+        if kv_fingerprint.is_enabled():
+            from sglang.srt.model_executor.cuda_graph_runner import (
+                get_is_capture_mode,
+            )
+            if not get_is_capture_mode():
+                _emit_topk_read_fingerprints(forward_batch, layer, page_table_1)
 
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:

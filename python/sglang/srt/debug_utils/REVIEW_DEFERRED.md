@@ -8,6 +8,28 @@ long-CoT load) and these findings live outside it. They become real
 bugs the moment this code is reused; document them here so the next
 person doesn't have to re-derive the analysis.
 
+> **2026-05-06 update — post-Arm-B retract→resume framing.**
+> The P2 retract-pressure ablation (Arm B, job 2039659) localized the
+> bug to the **decode-side retract→resume code path**: clamping
+> `--max-running-requests=8` holds peak `token_usage` at 0.69, fires
+> zero retracts, and produces 94 % pass@1 / 0 gibberish on the
+> otherwise-broken Step 5 recipe. The new top suspects are
+> H1'-via-retract / H2'-pointer-via-retract / H6'-via-retract.
+>
+> SGLang's disagg retract→resume is **not re-prefill via NIXL** — it
+> is a CPU↔GPU memcpy: `req.offload_kv_cache` saves the seq's MLA
+> `kv_buffer` bytes to a CPU buffer attached to the req, the slots are
+> freed, then `req.load_kv_cache` allocates fresh slots and writes the
+> CPU bytes back. **The NSA `index_k_with_scale_buffer` is never
+> offloaded/loaded** (NSATokenToKVPool inherits MLATokenToKVPool's
+> `get/load_cpu_copy` without override). Post-resume the new state-pool
+> pages contain whatever was at those page IDs from prior owners — the
+> direct H6'-via-retract surface.
+>
+> Two of the deferred items below have been promoted to **fixed** as a
+> result; one remains deferred but is explicitly noted as the next
+> follow-up if the trace localizes to PP>1 or HiSparse paths.
+
 ## M2 — MHA value-channel pages not fingerprinted
 
 `_send_kvcache_generic` transfers both K and V for MHA, registering
@@ -43,33 +65,33 @@ pool). The single-slot model is correct for this run.
 **Fix when needed:** key the registry by purpose (`"main"`, `"draft"`,
 `"host"`); refuse non-CUDA pools; or take the first registration only.
 
-## M6 — Hook C is over-broad (fingerprints all `req_to_token`, not topk)
+## ~~M6~~ — Hook C-narrow on `topk_indices` ✅ **PROMOTED TO FIXED (2026-05-06)**
 
-`_emit_first_read_fingerprints` is called at the top of NSA
-`forward_decode` and fingerprints all pages in
-`req_to_token[rpi, :seq_len]` — the full sequence-level page set, not
-the topk-selected page set NSA actually consults via
-`page_table_1` (built around lines 1659-1673 of `nsa_backend.py`
-from `topk_indices`). The hook captures the **superset**.
+Originally deferred as "H6'-narrow is a Step D2 follow-up." After Arm B
+localized the bug to retract→resume and made H6'-via-retract a top
+suspect, the superset Hook C alone is no longer adequate — it would
+mask the smoking gun (the surrounding pages match recv-fp; only the
+topk-selected page diverges).
 
-**Why deferred:** The current verdict matrix from §7 of the plan only
-needs Hook C to detect H1' (B≠C) and the absence-of-page case for H2'
-(pointer remap) — both of which work fine with the superset
-(corruption on a real read would still register as B≠C; missing pages
-still register as recv-without-read). Only **H6'-narrow** (NSA picks
-the wrong topk page from a correct page set) is degraded — the
-surrounding pages match recv-fps and drown the smoking gun. The plan
-already calls H6'-narrow out as a "Step D2 follow-up" (§8), so this
-is an explicit phase boundary, not an oversight.
+**Now implemented** in `nsa_backend.py`:
 
-**Fix when needed:** thread `page_table_1` through the hook signature
-(it varies per `nsa_decode_impl` — `flashmla_sparse`, `fa3_sparse`,
-`tilelang`, `trtllm`); call the hook **after** `page_table_1` is
-computed (post line 1673); fingerprint only the unique pages in
-`page_table_1`. Different NSA backends use slightly different
-indexing semantics for `page_table_1`, so be careful — log the raw
-entries and let the post-processor join on whatever namespace the
-recv side emits.
+- `_emit_topk_read_fingerprints(forward_batch, layer, physical_pages)` —
+  per-(rid, layer, page) fingerprint, dedup'd via `_FP_SEEN_PAGES_TOPK`,
+  events emitted with `is_topk: 1`.
+- Wired into `forward_decode`:
+  - **trtllm path:** before `_forward_trtllm`, do
+    `metadata.page_table_1.gather(1, topk_indices.clamp(min=0).long())`
+    to resolve position indices → physical pages, fingerprint those.
+  - **non-trtllm paths** (flashmla_sparse / flashmla_kv / tilelang /
+    fa3 / aiter): call after `page_table_1` is built (the
+    transform_index_page_table_decode result is already physical pages).
+  - Skipped during cuda-graph capture, same as superset hook.
+- The original superset hook is still emitted (with `is_topk: 0`) to
+  keep H1'/H2' detection — superset and narrow are complementary.
+
+`forward_extend` not yet wired — extends are usually short and the
+H6'-via-retract surface is a decode-side bookkeeping issue. Add
+symmetrically if a follow-on run needs it.
 
 ## m1 — Non-paged `TokenToKVPoolAllocator.free` deferred-free double-log
 
