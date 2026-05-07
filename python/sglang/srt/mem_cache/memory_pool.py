@@ -2065,20 +2065,23 @@ class NSATokenToKVPool(MLATokenToKVPool):
         return {"kv": kv_cpu, "state": state_cpu}
 
     def load_cpu_copy(self, cpu_copy, indices):
-        if isinstance(cpu_copy, dict):
-            kv_cpu = cpu_copy["kv"]
-            state_cpu = cpu_copy["state"]
-        else:
-            # Backward compat: payload from a non-NSA snapshot. Treat as
-            # KV-only and skip the state restore (will be recomputed by
-            # whatever path produced it).
-            kv_cpu = cpu_copy
-            state_cpu = None
+        # Fail loud rather than silently degrade. The override always emits
+        # the dict payload from get_cpu_copy; a non-dict payload would only
+        # reach us if a future refactor accidentally bypassed get_cpu_copy
+        # on the producer side. Restoring just kv_buffer in that case would
+        # silently re-create the H6'-via-retract surface this override
+        # exists to close.
+        if not isinstance(cpu_copy, dict) or "kv" not in cpu_copy or "state" not in cpu_copy:
+            raise TypeError(
+                "NSATokenToKVPool.load_cpu_copy expects the dict payload "
+                f"from NSATokenToKVPool.get_cpu_copy; got {type(cpu_copy).__name__}. "
+                "Skipping the state restore would leak prior-owner bytes "
+                "into index_k_with_scale_buffer (H6'-via-retract)."
+            )
+        kv_cpu = cpu_copy["kv"]
+        state_cpu = cpu_copy["state"]
 
         super().load_cpu_copy(kv_cpu, indices)
-
-        if state_cpu is None:
-            return
 
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
