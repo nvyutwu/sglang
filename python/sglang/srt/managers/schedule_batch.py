@@ -1251,6 +1251,23 @@ class Req(ReqDllmMixin):
                 },
             )
         self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(token_indices)
+        # CPU-payload oracle: hash the bytes that will be saved off-GPU.
+        # Pairs with the post-load re-gather hash (label="loaded") in
+        # load_kv_cache below. The CPU payload contains only the seq's
+        # own per-token slices, so this fp has no page-row alignment
+        # ambiguity that ``snapshot_seq_pages`` suffers from for the
+        # token-major MLA kv_buffer.
+        if _fp.is_enabled():
+            _fp.fingerprint_cpu_payload(
+                getattr(self, "rid", ""),
+                self.kv_cache_cpu,
+                rpi=int(self.req_pool_idx),
+                label="offload",
+                extra={
+                    "n_output_ids": len(getattr(self, "output_ids", []) or []),
+                    "seqlen": int(self.seqlen),
+                },
+            )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1277,6 +1294,33 @@ class Req(ReqDllmMixin):
                     "rti_fp": _fp.req_to_token_fp(token_indices),
                 },
             )
+        # CPU-payload oracle (post-load half): re-gather just-loaded GPU
+        # bytes via the same per-token slot indices and hash. Pairs with
+        # the offload-side hash. ``fp(offload) == fp(loaded)`` per cycle
+        # per (channel, layer) is a clean CPU↔GPU round-trip oracle that
+        # bypasses the page-row alignment artifact in snapshot_seq_pages.
+        # Costs one extra D2H per cycle when the env var is set; off in
+        # production (gated on ``is_enabled()``).
+        if _fp.is_enabled():
+            try:
+                roundtrip = token_to_kv_pool_allocator.get_cpu_copy(token_indices)
+                _fp.fingerprint_cpu_payload(
+                    getattr(self, "rid", ""),
+                    roundtrip,
+                    rpi=int(self.req_pool_idx),
+                    label="loaded",
+                    extra={
+                        "n_output_ids": len(getattr(self, "output_ids", []) or []),
+                        "seqlen": int(self.seqlen),
+                    },
+                )
+                del roundtrip
+            except Exception as e:
+                _fp.log({
+                    "ev": "_snap_cpu_err", "label": "loaded",
+                    "rid": getattr(self, "rid", ""),
+                    "err": f"{type(e).__name__}: {e}",
+                })
         del self.kv_cache_cpu
 
     def log_time_stats(self):

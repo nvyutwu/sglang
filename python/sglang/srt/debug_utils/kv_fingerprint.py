@@ -425,6 +425,100 @@ def req_to_token_fp(token_indices) -> str:
         return f"err:{type(e).__name__}"
 
 
+def fingerprint_cpu_payload(
+    rid: str,
+    payload,
+    *,
+    label: str,
+    rpi: int = -1,
+    extra: Optional[dict] = None,
+) -> None:
+    """Per-(channel, layer) fingerprint of a CPU payload from
+    ``get_cpu_copy`` (offload side) or a re-gather after ``load_cpu_copy``
+    (load side). Emits ``snap_cpu`` events.
+
+    The CPU payload contains ONLY the seq's own per-token slices (the
+    gather/scatter use exact slot indices); there are no neighbor bytes
+    and no page-row alignment to worry about. Comparing
+    ``snap_cpu{label="offload", channel, layer}.fp`` to the corresponding
+    ``snap_cpu{label="loaded"}.fp`` per cycle is a clean CPU↔GPU
+    round-trip oracle for each channel:
+
+      ``offload.fp == loaded.fp``  →  channel round-tripped bit-perfect
+      ``offload.fp != loaded.fp``  →  load_cpu_copy or get_cpu_copy is
+                                       wrong for this channel
+
+    Payload layouts handled:
+      * NSA pool: ``{"kv": [[chunk_tensor, ...], ...],
+                     "state": [[(k_chunk, s_chunk), ...], ...]}``
+      * MLA / MHA pool: ``[[chunk_tensor, ...], ...]``
+        (kv channel only — state channel events simply don't fire)
+
+    Cost: one fp per (channel, layer) per call. With 78 layers × 2
+    channels × 2 labels per cycle, ~312 events per cycle — far smaller
+    than ``snapshot_seq_pages`` (~3K events per cycle on this model).
+    """
+    if not is_enabled():
+        return
+    t_ns = time.time_ns()
+    base = {"ev": "snap_cpu", "label": label, "rid": rid, "rpi": rpi}
+    if extra:
+        base.update(extra)
+
+    if isinstance(payload, dict):
+        kv_layers = payload.get("kv")
+        state_layers = payload.get("state")
+    else:
+        kv_layers = payload
+        state_layers = None
+
+    def _hash_layer_chunks(chunks) -> str:
+        """Chain blake2b over chunks; tuples (e.g. NSA state's (k,s)) are
+        flattened in declared order so kv vs state agree on chunk count."""
+        h = hashlib.blake2b(digest_size=8)
+        for chunk in chunks:
+            if isinstance(chunk, tuple):
+                for c in chunk:
+                    h.update(_chunk_to_bytes(c))
+            else:
+                h.update(_chunk_to_bytes(chunk))
+        return h.hexdigest()
+
+    if kv_layers is not None:
+        for layer_id, chunks in enumerate(kv_layers):
+            try:
+                fp = _hash_layer_chunks(chunks)
+            except Exception as e:
+                fp = f"err:{type(e).__name__}"
+            ev = dict(base)
+            ev.update({"channel": "kv", "layer": layer_id, "fp": fp,
+                       "t_ns": t_ns})
+            log(ev)
+
+    if state_layers is not None:
+        for layer_id, chunks in enumerate(state_layers):
+            try:
+                fp = _hash_layer_chunks(chunks)
+            except Exception as e:
+                fp = f"err:{type(e).__name__}"
+            ev = dict(base)
+            ev.update({"channel": "state", "layer": layer_id, "fp": fp,
+                       "t_ns": t_ns})
+            log(ev)
+
+
+def _chunk_to_bytes(t) -> bytes:
+    """Best-effort tensor → bytes. Handles CPU tensors via numpy; falls
+    back to a synchronous .cpu() copy for stray GPU tensors so the
+    fingerprint doesn't silently skip them.
+    """
+    if hasattr(t, "is_cuda") and t.is_cuda:
+        t = t.detach().cpu()
+    elif hasattr(t, "detach"):
+        t = t.detach()
+    return t.contiguous().numpy().tobytes()
+
+
 def snapshot_seq_pages(
     rid: str,
     token_indices,
