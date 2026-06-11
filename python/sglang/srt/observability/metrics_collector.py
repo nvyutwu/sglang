@@ -112,6 +112,13 @@ class SchedulerStats:
     # Adaptive speculative decoding (currently active tier).
     spec_num_steps: int = 0
     spec_num_draft_tokens: int = 0
+    # Per-position acceptance (vLLM-style): cumulative counters fed per-interval.
+    # `spec_decode_accepted_tokens_per_pos[i]` = drafts accepted at draft depth i
+    # this interval; `spec_decode_num_drafts` is the shared rate denominator.
+    spec_decode_num_drafts: int = 0
+    spec_decode_num_draft_tokens: int = 0
+    spec_decode_num_accepted_tokens: int = 0
+    spec_decode_accepted_tokens_per_pos: List[int] = field(default_factory=list)
 
     # Retract
     num_retracted_reqs: int = 0
@@ -434,6 +441,32 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Currently active speculative_num_draft_tokens (decouples from steps under topk>1).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        # Cumulative spec-decode counters (vLLM-compatible). Monotonic; rates
+        # are derived in PromQL. Per-position acceptance rate:
+        #   sglang:spec_decode_num_accepted_tokens_per_pos_total
+        #     / sglang:spec_decode_num_drafts_total
+        # (the single drafts counter is the shared denominator for every
+        # position, matching the marginal definition.)
+        self.spec_decode_num_drafts = Counter(
+            name="sglang:spec_decode_num_drafts_total",
+            documentation="Number of speculative-decoding draft sequences (one per request per verify step).",
+            labelnames=labels.keys(),
+        )
+        self.spec_decode_num_draft_tokens = Counter(
+            name="sglang:spec_decode_num_draft_tokens_total",
+            documentation="Number of draft tokens proposed across all positions.",
+            labelnames=labels.keys(),
+        )
+        self.spec_decode_num_accepted_tokens = Counter(
+            name="sglang:spec_decode_num_accepted_tokens_total",
+            documentation="Number of accepted draft tokens (excludes the bonus token).",
+            labelnames=labels.keys(),
+        )
+        self.spec_decode_num_accepted_tokens_per_pos = Counter(
+            name="sglang:spec_decode_num_accepted_tokens_per_pos_total",
+            documentation="Accepted draft tokens per draft position (`position` = 0-indexed draft depth).",
+            labelnames=list(labels.keys()) + ["position"],
         )
 
         # =================================================================
@@ -1288,6 +1321,22 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
         self._log_gauge(self.spec_num_steps, stats.spec_num_steps)
         self._log_gauge(self.spec_num_draft_tokens, stats.spec_num_draft_tokens)
+        # Cumulative spec-decode counters (incremented by this interval's delta).
+        if stats.spec_decode_num_drafts:
+            self.spec_decode_num_drafts.labels(**self.labels).inc(
+                stats.spec_decode_num_drafts
+            )
+            self.spec_decode_num_draft_tokens.labels(**self.labels).inc(
+                stats.spec_decode_num_draft_tokens
+            )
+            self.spec_decode_num_accepted_tokens.labels(**self.labels).inc(
+                stats.spec_decode_num_accepted_tokens
+            )
+            for pos, cnt in enumerate(stats.spec_decode_accepted_tokens_per_pos):
+                if cnt:
+                    self.spec_decode_num_accepted_tokens_per_pos.labels(
+                        **self.labels, position=str(pos)
+                    ).inc(cnt)
 
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
