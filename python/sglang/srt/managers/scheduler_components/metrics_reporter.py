@@ -139,6 +139,10 @@ class SchedulerMetricsReporter:
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
+        # Per-position accepted-draft accumulator (drafts-only, marginal),
+        # reset every decode_log_interval. Index = 0-based draft depth; grown
+        # on demand. Mirrors vLLM SpecDecodingStats.num_accepted_tokens_per_pos.
+        self.spec_accepted_per_pos: List[int] = []
 
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
@@ -344,9 +348,27 @@ class SchedulerMetricsReporter:
             "num_draft_tokens": num_draft_tokens or 0,
         }
 
-    def update_spec_metrics(self, bs: int, num_correct_drafts: int):
+    def update_spec_metrics(
+        self,
+        bs: int,
+        num_correct_drafts: int,
+        num_correct_drafts_per_req: Optional[List[int]] = None,
+    ):
         self.spec_num_accept_tokens += num_correct_drafts + bs
         self.spec_num_forward_ct += bs
+
+        # Per-position (marginal): draft depth i is accepted iff a request
+        # accepted more than i drafts. Mirrors vLLM SpecDecodingStats.
+        if num_correct_drafts_per_req:
+            for n in num_correct_drafts_per_req:
+                if n <= 0:
+                    continue
+                if len(self.spec_accepted_per_pos) < n:
+                    self.spec_accepted_per_pos.extend(
+                        [0] * (n - len(self.spec_accepted_per_pos))
+                    )
+                for i in range(n):
+                    self.spec_accepted_per_pos[i] += 1
 
         # Bonus tokens updated elsewhere
         self.num_generated_tokens += num_correct_drafts
@@ -506,6 +528,7 @@ class SchedulerMetricsReporter:
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
+        self.spec_accepted_per_pos = []
 
     def report_prefill_stats(
         self,
@@ -726,6 +749,10 @@ class SchedulerMetricsReporter:
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0
+        spec_decode_num_drafts = 0
+        spec_decode_num_draft_tokens = 0
+        spec_decode_num_accepted_tokens = 0
+        spec_decode_accepted_tokens_per_pos = []
         if self.scheduler.spec_algorithm.is_none():
             spec_accept_length = 0
             spec_accept_rate = 0
@@ -742,6 +769,13 @@ class SchedulerMetricsReporter:
             spec_accept_rate = (
                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
             )
+            # Snapshot this interval for the cumulative vLLM-style counters,
+            # then reset the per-position accumulator with the aggregate ones.
+            spec_decode_num_drafts = self.spec_num_forward_ct
+            spec_decode_num_draft_tokens = total_draft_tokens
+            spec_decode_num_accepted_tokens = num_correct_drafts
+            spec_decode_accepted_tokens_per_pos = self.spec_accepted_per_pos
+            self.spec_accepted_per_pos = []
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
@@ -823,6 +857,12 @@ class SchedulerMetricsReporter:
             self.stats.spec_accept_rate = spec_accept_rate
             self.stats.spec_num_steps = spec_num_steps
             self.stats.spec_num_draft_tokens = spec_num_draft_tokens
+            self.stats.spec_decode_num_drafts = spec_decode_num_drafts
+            self.stats.spec_decode_num_draft_tokens = spec_decode_num_draft_tokens
+            self.stats.spec_decode_num_accepted_tokens = spec_decode_num_accepted_tokens
+            self.stats.spec_decode_accepted_tokens_per_pos = (
+                spec_decode_accepted_tokens_per_pos
+            )
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
