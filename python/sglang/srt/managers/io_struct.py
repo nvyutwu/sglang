@@ -654,6 +654,11 @@ class GenerateReqInput:
         if i in cache:
             return cache[i]
         sub = GenerateReqInput(
+            # Carry the reasoning-deferral flag into batched sub-requests; without
+            # this, n>1 / list-input requests reset to require_reasoning=False and
+            # the JSON grammar masks thinking tokens (collapses thinking-on guided
+            # decoding). Pairs with the maybe_init_reasoning(True) reset.
+            require_reasoning=self.require_reasoning,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
