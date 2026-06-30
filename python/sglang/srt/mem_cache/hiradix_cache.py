@@ -1266,7 +1266,7 @@ class HiRadixCache(RadixCache):
         # metric, so host-tier overflow was previously uncounted.
         if num_evicted > 0 and self.metrics_collector is not None:
             self.metrics_collector.increment_eviction_num_tokens(
-                num_evicted, cache_type="host"
+                num_evicted, cache_type=f"{type(self).__name__}_host"
             )
 
     def load_back(

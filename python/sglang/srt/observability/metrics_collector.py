@@ -2052,11 +2052,11 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.eviction_num_tokens = Counter(
             name="sglang:evicted_tokens_total",
             documentation=(
-                "Number of tokens evicted, split by tier via cache_type: "
-                "'device' = GPU->CPU eviction (L1), "
-                "'host' = CPU-RAM overflow eviction (L2, HiRadixCache host pool)."
+                "Number of tokens evicted. The cache_type label is the cache "
+                "class (e.g. HiRadixCache) for device (GPU->CPU / L1) eviction, "
+                "and <class>_host for CPU-RAM (L2) overflow eviction."
             ),
-            labelnames=list(labels.keys()) + ["cache_type"],
+            labelnames=labels.keys(),
         )
 
         self.load_back_duration_seconds = Histogram(
@@ -2073,11 +2073,17 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         )
 
     def increment_eviction_num_tokens(
-        self, num_tokens: int, cache_type: str = "device"
+        self, num_tokens: int, cache_type: Optional[str] = None
     ) -> None:
-        self.eviction_num_tokens.labels(
-            **self.labels, cache_type=cache_type
-        ).inc(num_tokens)
+        # cache_type already lives in self.labels (= cache class name). Pass an
+        # override (e.g. "<class>_host") to distinguish CPU-RAM/L2 overflow
+        # eviction; merge into one dict so the label is never passed twice.
+        label_values = (
+            self.labels
+            if cache_type is None
+            else {**self.labels, "cache_type": cache_type}
+        )
+        self.eviction_num_tokens.labels(**label_values).inc(num_tokens)
 
     def increment_load_back_num_tokens(self, num_tokens: int) -> None:
         self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)
