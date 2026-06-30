@@ -2050,8 +2050,12 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
         self.eviction_num_tokens = Counter(
             name="sglang:evicted_tokens_total",
-            documentation="The number of tokens evicted from GPU to CPU.",
-            labelnames=labels.keys(),
+            documentation=(
+                "Number of tokens evicted, split by tier via cache_type: "
+                "'device' = GPU->CPU eviction (L1), "
+                "'host' = CPU-RAM overflow eviction (L2, HiRadixCache host pool)."
+            ),
+            labelnames=list(labels.keys()) + ["cache_type"],
         )
 
         self.load_back_duration_seconds = Histogram(
@@ -2067,8 +2071,12 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
-    def increment_eviction_num_tokens(self, num_tokens: int) -> None:
-        self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+    def increment_eviction_num_tokens(
+        self, num_tokens: int, cache_type: str = "device"
+    ) -> None:
+        self.eviction_num_tokens.labels(
+            **self.labels, cache_type=cache_type
+        ).inc(num_tokens)
 
     def increment_load_back_num_tokens(self, num_tokens: int) -> None:
         self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)

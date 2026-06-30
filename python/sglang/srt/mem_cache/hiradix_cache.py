@@ -1167,6 +1167,14 @@ class HiRadixCache(RadixCache):
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
+        # Count L2/CPU-RAM overflow eviction. The device path (evict) reports
+        # cache_type="device" via update_eviction_metrics; evict_host had no
+        # metric, so host-tier overflow was previously uncounted.
+        if num_evicted > 0 and self.metrics_collector is not None:
+            self.metrics_collector.increment_eviction_num_tokens(
+                num_evicted, cache_type="host"
+            )
+
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
