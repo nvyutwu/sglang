@@ -141,6 +141,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # (Kimi-K3 token-0 collapse, 2026-10-12). Opt-in: zero pages on hand-out, as the unified
         # pool does (`MultiEndedAlloc._maybe_zero_pages`).
         self._zero_pages = None
+        # Set by the scheduler to the forward stream (see _zero_new_pages).
+        self.zero_fence_stream = None
         if get_bool_env_var("SGLANG_ZERO_MLA_PAGES_ON_ALLOC"):
             pool = getattr(kvcache, "full_kv_pool", kvcache)
             if type(pool).__name__ == "MLATokenToKVPool":
@@ -192,7 +194,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
         if self._zero_pages is not None and num_pages > 0:
-            self._zero_pages(out_pages)
+            self._zero_new_pages(out_pages)
 
         out_indices = (
             out_pages[:, None] * self.page_size
@@ -248,7 +250,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # The kernels above hand out free_pages[:num_new_pages], in order.
         if self._zero_pages is not None and num_new_pages > 0:
-            self._zero_pages(self.free_pages[:num_new_pages])
+            self._zero_new_pages(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -290,9 +292,18 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # The kernels above hand out free_pages[:num_new_pages], in order.
         if self._zero_pages is not None and num_new_pages > 0:
-            self._zero_pages(self.free_pages[:num_new_pages])
+            self._zero_new_pages(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
+
+    def _zero_new_pages(self, page_ids: torch.Tensor) -> None:
+        # Under overlap scheduling, pages released after step N-1 can still be written by forward N:
+        # a request that finished at N-1 keeps its overlap slot in batch N, and the LIFO free list
+        # hands its tail page straight to N+1. Zero only after forward N, or a late write leaves a
+        # stale (possibly NaN) row behind the zero. Same fence as the HiCache load stream's.
+        if self.zero_fence_stream is not None:
+            torch.cuda.current_stream().wait_stream(self.zero_fence_stream)
+        self._zero_pages(page_ids)
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:

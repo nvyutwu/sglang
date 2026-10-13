@@ -4716,6 +4716,8 @@ class MLATokenToKVPool(KVCache):
             + torch.arange(self.page_size, device=page_ids.device)
         ).reshape(-1)
         for kv_cache in self.kv_buffer:
+            if kv_cache.shape[0] == 0:
+                continue
             kv_cache.view(torch.uint8).index_fill_(0, rows, 0)
 
     def get_kv_size_bytes(self):

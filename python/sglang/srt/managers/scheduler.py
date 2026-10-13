@@ -590,6 +590,11 @@ class Scheduler(
         self.swa_tokens_per_layer = result.swa_tokens_per_layer
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        if getattr(self.token_to_kv_pool_allocator, "_zero_pages", None) is not None:
+            # SGLANG_ZERO_MLA_PAGES_ON_ALLOC: zero handed-out pages only after the in-flight forward.
+            self.token_to_kv_pool_allocator.zero_fence_stream = (
+                self.tp_worker.model_runner.forward_stream
+            )
         self.kv_shard_widening = page_interleave_shard_size(
             self.token_to_kv_pool_allocator
         )
