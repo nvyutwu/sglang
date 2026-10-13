@@ -3,14 +3,21 @@
 Observation only; no output changes. Built for the Kimi-K3 token-0 ('!') collapse, where the
 spread is fixed (zero-on-alloc + DCP page-table tail) but the origin of the first NaN is open.
 
-Always on (CUDA-graph safe, no host sync; in-place updates of preallocated device buffers,
-captured with the graph and run on every replay):
-  * per decoder layer, for the self_attn output and the mlp output: the first forward step
-    with a NaN row, that row's position, and the cumulative NaN row count;
-  * per FP8 conversion site (prefill q/k/v in trtllm_mla_backend._quantize_fp8_qkv; decode
-    q, q_rope, k, k_rope in the fused KV/Q writer and the mla_quantize_* helpers): the
-    running max |x| of the input, the number of calls with |x| > 448 (an e4m3 overflow,
-    which a non-saturating conversion stores as NaN) and the first step of such a call.
+Recorders (CUDA-graph safe, no host sync; in-place updates of preallocated device buffers,
+captured with the graph and run on every replay). Their cost differs a lot, so only the cheap
+ones are on by default:
+  * prefill FP8 conversion (trtllm_mla_backend._quantize_fp8_qkv: q/k/v; on by default, runs
+    once per prefill chunk and MLA layer): running max |x|, calls with |x| > 448 (an e4m3
+    overflow, which this non-saturating conversion stores as NaN), first step;
+  * per decoder layer, self_attn and mlp outputs: first step with a NaN row, its position,
+    cumulative NaN rows. OPT-IN (SGLANG_NAN_FORENSICS_LAYERS=1): ~10 small kernels per hook
+    on every decode step; measured -30 % decode throughput on K3 GB300 TP8 DCP8 together with
+    the decode FP8 recorder;
+  * decode FP8 conversion (q, q_rope, k, k_rope in the fused KV/Q writer and mla_quantize_*):
+    OPT-IN (SGLANG_NAN_FORENSICS_DECODE_FP8=1); the fused writer saturates (SATFINITE) in the
+    fix image, so these are headroom statistics only.
+Without the per-layer recorder an incident still localizes the NaN through the census: the
+lowest MLA layer with a NaN KV row at the earliest NaN position, and the lowest NaN KDA layer.
 
 On an incident (a sampled logits row is NaN; called by the batch result processor, on
 every TP rank, after a device sync), each rank logs one line prefixed NAN_INCIDENT with:
@@ -140,7 +147,7 @@ def _wrap_fn(fn, sites):
     return wrapped
 
 
-def _patch_fp8_sites() -> List[str]:
+def _patch_fp8_sites(decode: bool) -> List[str]:
     patched = []
     dec = ["dec_q", "dec_q_rope", "dec_k", "dec_k_rope"]
     try:
@@ -149,6 +156,8 @@ def _patch_fp8_sites() -> List[str]:
         if hasattr(trt, "_quantize_fp8_qkv"):
             trt._quantize_fp8_qkv = _wrap_fn(trt._quantize_fp8_qkv, ["prefill_q", "prefill_k", "prefill_v"])
             patched.append("trtllm._quantize_fp8_qkv")
+        if not decode:
+            return patched
         for name in ("mla_quantize_without_rope_for_fp8", "mla_quantize_and_rope_for_fp8"):
             if hasattr(trt, name):
                 setattr(trt, name, _wrap_fn(getattr(trt, name), dec))
@@ -216,15 +225,18 @@ def maybe_install(model: torch.nn.Module) -> None:
             _S.positions = kwargs.get("positions", args[1] if len(args) > 1 else None)
 
         dec.register_forward_pre_hook(pre, with_kwargs=True)
-        for i, layer in enumerate(dec.layers):
-            for k, name in enumerate(KINDS):
-                sub = getattr(layer, "self_attn" if name == "attn" else "mlp", None)
-                if sub is not None:
-                    sub.register_forward_hook(lambda m, a, o, i=i, k=k: _record_nan(i, k, o))
-        patched = _patch_fp8_sites()
+        layers_on = envs.SGLANG_NAN_FORENSICS_LAYERS.get()
+        if layers_on:
+            for i, layer in enumerate(dec.layers):
+                for k, name in enumerate(KINDS):
+                    sub = getattr(layer, "self_attn" if name == "attn" else "mlp", None)
+                    if sub is not None:
+                        sub.register_forward_hook(lambda m, a, o, i=i, k=k: _record_nan(i, k, o))
+        patched = _patch_fp8_sites(decode=envs.SGLANG_NAN_FORENSICS_DECODE_FP8.get())
         _S.installed = True
         _log("NAN_FORENSICS", {"event": "installed", "layers": n, "decoder": type(dec).__name__,
-                               "fp8_sites": patched, "device": str(dev), "pid": os.getpid()})
+                               "layer_recorders": bool(layers_on), "fp8_sites": patched,
+                               "device": str(dev), "pid": os.getpid()})
     except Exception as e:  # never break the engine
         _log("NAN_FORENSICS", {"event": "install_failed", "error": repr(e)})
 
@@ -333,6 +345,10 @@ def _kv_census(proc, req, seq_len: int) -> Dict[str, Any]:
             nan_layers.append({"mla": j, "layer": inv.get(j, -1), "nan_rows": n,
                                "first_pos": int(p.min()), "last_pos": int(p.max())})
     out["nan_layers"] = nan_layers
+    if nan_layers:  # where the NaN entered the KV: earliest position, lowest layer holding it
+        p0 = min(l["first_pos"] for l in nan_layers)
+        at = [l for l in nan_layers if l["first_pos"] == p0]
+        out["first_nan"] = {"pos": p0, "layer": min(l["layer"] for l in at), "mla": min(l["mla"] for l in at)}
     return out
 
 

@@ -1362,6 +1362,10 @@ class Envs:
     # state, whenever a sampled logits row is NaN. Observation only; see nan_forensics.
     SGLANG_NAN_FORENSICS = EnvBool(False)
     SGLANG_NAN_FORENSICS_HEARTBEAT_S = EnvInt(600)
+    # Opt-in, costly recorders (see nan_forensics): per-layer first-NaN hooks on every decode step,
+    # and decode FP8 conversion stats.
+    SGLANG_NAN_FORENSICS_LAYERS = EnvBool(False)
+    SGLANG_NAN_FORENSICS_DECODE_FP8 = EnvBool(False)
     SGLANG_ENABLE_LOGPROB_CHUNK = EnvBool(True)
     SGLANG_LOGPROB_CHUNK_SIZE = EnvInt(2048)
     # Compute input logprobs from logits via per-row logsumexp instead of
