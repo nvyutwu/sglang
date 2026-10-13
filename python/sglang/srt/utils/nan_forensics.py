@@ -23,7 +23,9 @@ every TP rank, after a device sync), each rank logs one line prefixed NAN_INCIDE
     per layer (NaN / Inf / all-zero);
   * client aborts seen by the scheduler in the last 300 s.
 Rank 0 also logs a NAN_FORENSICS heartbeat every SGLANG_NAN_FORENSICS_HEARTBEAT_S seconds
-when anything changed (FP8 headroom per site, NaN rows per kind).
+when anything changed (FP8 headroom per site, NaN rows per kind, its page-0 census). Every rank
+checks the reserved page 0 of the MLA KV pool (CUDA-graph padding tokens write there; it is never
+handed out, so zero-on-alloc never clears it) and logs a NAN_FORENSICS page0 line if it holds NaN.
 
 How to read an incident:
   * NaN first in an mlp output while every attn output of that step is clean -> MoE /
@@ -33,6 +35,9 @@ How to read an incident:
   * KV or KDA NaN at positions the request did not compute in this process (inside the
     cached / host-hit prefix) -> corrupt cached state (HiCache load-back, abort race).
   * NaN first on one rank only (compare the ranks' lines) -> that GPU or its local KV.
+  * page-0 NaN (heartbeat / page0 lines) -> padding writes landed NaN in the reserved slot; the
+    open question is then which read path reaches page 0 (the fused FP8 KV/Q writer has no
+    slot-0 skip under DCP, unlike store_cache / set_mla_kv_buffer since #32477).
 """
 
 import collections
@@ -77,6 +82,9 @@ class _State:
     hb_last: Any = None
     hb_t = 0.0
     hb_pending = False
+    hb_rank0 = False
+    hb_p0_host: Optional[torch.Tensor] = None
+    hb_p0_last: Any = None
 
 
 _S = _State()
@@ -385,22 +393,59 @@ def incident(proc, batch, flagged_idx: List[int]) -> None:
         _log("NAN_INCIDENT", {"incident": _S.incidents, "error": repr(e)})
 
 
-def heartbeat() -> None:
-    """Rank 0, low rate: FP8 headroom per site and NaN rows per kind, when changed. No sync:
-    every SGLANG_NAN_FORENSICS_HEARTBEAT_S seconds the counters are copied (non_blocking) to
-    pinned memory; the next call, one batch later, logs that copy."""
+def _page0_census(proc) -> Optional[torch.Tensor]:
+    """Device [L, 2]: per MLA layer, the rows of reserved page 0 (rows [0, page_size): CUDA-graph
+    padding tokens write there, and it is never handed out, so zero-on-alloc never clears it) that
+    hold an fp8 NaN byte, and those that hold a +-448 byte (the saturated e4m3 maximum)."""
+    kvcache = proc.token_to_kv_pool_allocator.get_kvcache()
+    full = getattr(kvcache, "full_kv_pool", kvcache)
+    bufs = getattr(full, "kv_buffer", None)
+    ps = int(getattr(full, "page_size", 0) or 0)
+    if not bufs or ps <= 0:
+        return None
+    out = []
+    for buf in bufs:
+        if buf is None or buf.shape[0] < ps:
+            continue
+        rows = buf[:ps]
+        if rows.dtype in (torch.uint8, torch.int8) or "float8" in str(rows.dtype):
+            u = rows.view(torch.uint8).reshape(ps, -1) & 0x7F
+            nan, sat = (u == 0x7F).any(-1), (u == 0x7E).any(-1)
+        else:
+            f = rows.float().reshape(ps, -1)
+            nan, sat = torch.isnan(f).any(-1), torch.isinf(f).any(-1)
+        out.append(torch.stack([nan.sum(), sat.sum()]))
+    return torch.stack(out) if out else None
+
+
+def heartbeat(proc=None) -> None:
+    """Low rate, no sync: every SGLANG_NAN_FORENSICS_HEARTBEAT_S seconds the counters (rank 0) and
+    the page-0 census (every rank, needs ``proc``) are copied (non_blocking) to pinned memory; the
+    next call, one batch later, logs that copy. Rank 0 logs FP8 headroom per site, NaN rows per
+    kind and its page-0 counts when anything changed; any rank whose page 0 holds NaN logs that."""
     if not enabled() or _S.ovf_max is None:
         return
     try:
         if _S.hb_pending:
             _S.hb_pending = False
-            step, om, oc, nr = [h.clone() for h in _S.hb_host]
-            snap = ([round(v, 1) for v in om.tolist()], oc.tolist(), nr.sum(0).tolist())
-            if snap != _S.hb_last:
-                _S.hb_last = snap
-                _log("NAN_FORENSICS", {"event": "heartbeat", "step": int(step[0]),
-                                       "ovf_max": dict(zip(SITES, snap[0])), "ovf_calls": dict(zip(SITES, snap[1])),
-                                       "nan_rows": dict(zip(KINDS, snap[2])), "incidents": _S.incidents})
+            p0 = None
+            if _S.hb_p0_host is not None:
+                h = _S.hb_p0_host.clone()
+                p0 = {"nan_rows": int(h[:, 0].sum()), "sat_rows": int(h[:, 1].sum()),
+                      "nan_layers": torch.nonzero(h[:, 0]).flatten().tolist(),
+                      "sat_layers": torch.nonzero(h[:, 1]).flatten().tolist()}
+            if _S.hb_rank0:
+                step, om, oc, nr = [h.clone() for h in _S.hb_host]
+                snap = ([round(v, 1) for v in om.tolist()], oc.tolist(), nr.sum(0).tolist(), p0)
+                if snap != _S.hb_last:
+                    _S.hb_last = snap
+                    _log("NAN_FORENSICS", {"event": "heartbeat", "step": int(step[0]),
+                                           "ovf_max": dict(zip(SITES, snap[0])), "ovf_calls": dict(zip(SITES, snap[1])),
+                                           "nan_rows": dict(zip(KINDS, snap[2])), "page0": p0,
+                                           "incidents": _S.incidents})
+            elif p0 is not None and p0["nan_rows"] and p0 != _S.hb_p0_last:
+                _S.hb_p0_last = p0
+                _log("NAN_FORENSICS", {"event": "page0", **_rank_info(), "page0": p0})
             return
         now = time.time()
         if now - _S.hb_t < envs.SGLANG_NAN_FORENSICS_HEARTBEAT_S.get():
@@ -408,13 +453,19 @@ def heartbeat() -> None:
         _S.hb_t = now
         from sglang.srt.runtime_context import get_parallel
 
-        if getattr(get_parallel(), "tp_rank", 0) != 0:
-            return
-        bufs = [_S.step, _S.ovf_max, _S.ovf_calls, _S.nan_rows]
-        if _S.hb_host is None:
-            _S.hb_host = [torch.empty_like(b, device="cpu").pin_memory() for b in bufs]
-        for h, b in zip(_S.hb_host, bufs):
-            h.copy_(b, non_blocking=True)
-        _S.hb_pending = True
+        _S.hb_rank0 = getattr(get_parallel(), "tp_rank", 0) == 0
+        if _S.hb_rank0:
+            bufs = [_S.step, _S.ovf_max, _S.ovf_calls, _S.nan_rows]
+            if _S.hb_host is None:
+                _S.hb_host = [torch.empty_like(b, device="cpu").pin_memory() for b in bufs]
+            for h, b in zip(_S.hb_host, bufs):
+                h.copy_(b, non_blocking=True)
+        if proc is not None:
+            p0 = _page0_census(proc)
+            if p0 is not None:
+                if _S.hb_p0_host is None or _S.hb_p0_host.shape != p0.shape:
+                    _S.hb_p0_host = torch.empty(p0.shape, dtype=p0.dtype, pin_memory=True)
+                _S.hb_p0_host.copy_(p0, non_blocking=True)
+        _S.hb_pending = _S.hb_rank0 or _S.hb_p0_host is not None
     except Exception as e:
         _log("NAN_FORENSICS", {"event": "heartbeat_failed", "error": repr(e)})

@@ -1311,7 +1311,7 @@ class SchedulerBatchResultProcessor:
         others. Speculative batches are skipped: their logits rows are draft positions,
         not requests (as for SGLANG_COUNT_NAN_LOGITS).
         """
-        nan_forensics.heartbeat()
+        nan_forensics.heartbeat(self)
         if logits_output is None or not batch.spec_algorithm.is_none():
             return
         any_host = logits_output.nan_rows_any_host
