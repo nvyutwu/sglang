@@ -276,6 +276,17 @@ def _probe_table() -> Dict[str, Any]:
     }
 
 
+def _slot(req, name: str) -> Optional[int]:
+    """A request's pool slot. Req keeps req_pool_idx / mamba_pool_idx on req.kv (ReqKvInfo);
+    mamba_pool_idx is a 1-element tensor."""
+    v = getattr(req, name, None)
+    if v is None:
+        v = getattr(getattr(req, "kv", None), name, None)
+    if isinstance(v, torch.Tensor):
+        v = int(v.reshape(-1)[0]) if v.numel() else None
+    return v
+
+
 def _is_nan_store(x: torch.Tensor) -> torch.Tensor:
     """Per-row NaN flag for a KV row tensor [n, ...] in its storage dtype."""
     if x.dtype in (torch.uint8, torch.int8) or "float8" in str(x.dtype):
@@ -289,9 +300,10 @@ def _kv_census(proc, req, seq_len: int) -> Dict[str, Any]:
     kvcache = proc.token_to_kv_pool_allocator.get_kvcache()
     full = getattr(kvcache, "full_kv_pool", kvcache)
     bufs = getattr(full, "kv_buffer", None)
-    if bufs is None or req.req_pool_idx is None or seq_len <= 0:
+    pool_idx = _slot(req, "req_pool_idx")
+    if bufs is None or pool_idx is None or seq_len <= 0:
         return {"skipped": "no kv_buffer or no req slot"}
-    slots = proc.req_to_token_pool.req_to_token[req.req_pool_idx, :seq_len].to(torch.int64)
+    slots = proc.req_to_token_pool.req_to_token[pool_idx, :seq_len].to(torch.int64)
     dcp_size, dcp_rank = 1, 0
     try:
         from sglang.srt.runtime_context import get_parallel
@@ -326,10 +338,9 @@ def _kv_census(proc, req, seq_len: int) -> Dict[str, Any]:
 
 def _kda_census(proc, req) -> Dict[str, Any]:
     pool = getattr(proc.req_to_token_pool, "mamba_pool", None)
-    idx = getattr(req, "mamba_pool_idx", None)
+    idx = _slot(req, "mamba_pool_idx")
     if pool is None or idx is None:
         return {"skipped": "no mamba pool or slot"}
-    idx = int(idx)
     st = pool.mamba_cache.temporal[:, idx]  # [L, ...]
     flat = st.float().reshape(st.shape[0], -1)
     nan = torch.isnan(flat).any(-1)
@@ -346,51 +357,74 @@ def _kda_census(proc, req) -> Dict[str, Any]:
     return out
 
 
+def _section(rec: Dict[str, Any], key: str, fn) -> None:
+    """Fill rec[key] from fn(); a failure is recorded in place and never drops the other sections."""
+    try:
+        rec[key] = fn()
+    except Exception as e:
+        rec[key] = {"error": repr(e)}
+
+
+def _req_info(proc, req, row: int, full: bool) -> Dict[str, Any]:
+    r: Dict[str, Any] = {"rid": getattr(req, "rid", None), "row": row}
+    try:
+        prompt = len(req.origin_input_ids)
+        out = len(req.output_ids)
+    except Exception:
+        prompt = out = -1
+    r.update(prompt_len=prompt, output_len=out, cached_tokens=getattr(req, "cached_tokens", None),
+             host_hit_length=getattr(req, "host_hit_length", None),
+             retracted=bool(getattr(req, "is_retracted", False)),
+             req_pool_idx=_slot(req, "req_pool_idx"), mamba_pool_idx=_slot(req, "mamba_pool_idx"))
+    if full:
+        _section(r, "kv", lambda: _kv_census(proc, req, prompt + out))
+        _section(r, "kda", lambda: _kda_census(proc, req))
+    return r
+
+
 def incident(proc, batch, flagged_idx: List[int]) -> None:
-    """Log one NAN_INCIDENT line on this rank for the flagged rows of ``batch``."""
+    """Log one NAN_INCIDENT line on this rank for the flagged rows of ``batch``. Every part of the
+    record (rank, batch, each request, census, first-NaN table, aborts) is filled independently."""
     if not enabled():
         return
     _S.incidents += 1
     full = _S.incidents <= _MAX_FULL_INCIDENTS or _S.incidents % 100 == 0
+    rec: Dict[str, Any] = {"incident": _S.incidents}
     try:
         torch.cuda.synchronize()
-        now = time.time()
-        rec: Dict[str, Any] = {"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
-                               "incident": _S.incidents, **_rank_info()}
+    except Exception as e:
+        rec["sync_error"] = repr(e)
+    now = time.time()
+    rec["t"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    try:
+        rec.update(_rank_info())
+    except Exception as e:
+        rec["rank_error"] = repr(e)
+
+    def batch_info():
         fm = getattr(batch, "forward_mode", None)
-        rec["batch"] = {"forward_mode": getattr(fm, "name", str(fm)), "size": len(batch.reqs),
-                        "overlap": bool(getattr(proc, "enable_overlap", False))}
-        reqs = []
-        for i in flagged_idx:
-            if i >= len(batch.reqs):
-                continue
-            req = batch.reqs[i]
-            seq_len = len(req.origin_input_ids) + len(req.output_ids)
-            r: Dict[str, Any] = {
-                "rid": req.rid, "row": i, "prompt_len": len(req.origin_input_ids),
-                "output_len": len(req.output_ids), "cached_tokens": getattr(req, "cached_tokens", None),
-                "host_hit_length": getattr(req, "host_hit_length", None),
-                "retracted": bool(getattr(req, "is_retracted", False)),
-                "req_pool_idx": req.req_pool_idx, "mamba_pool_idx": getattr(req, "mamba_pool_idx", None),
-            }
-            if full:
-                for name, fn in (("kv", lambda: _kv_census(proc, req, seq_len)), ("kda", lambda: _kda_census(proc, req))):
-                    try:
-                        r[name] = fn()
-                    except Exception as e:
-                        r[name] = {"error": repr(e)}
-            reqs.append(r)
-        rec["reqs"] = reqs
-        rec["probe"] = _probe_table()
-        rec["recent_aborts"] = [{"age_s": round(now - t, 1), "rid": rid}
-                                for t, rid in list(_S.aborts) if now - t <= _ABORT_WINDOW_S][-20:]
-        _log("NAN_INCIDENT", rec)
+        return {"forward_mode": getattr(fm, "name", str(fm)), "size": len(batch.reqs),
+                "overlap": bool(getattr(proc, "enable_overlap", False))}
+
+    _section(rec, "batch", batch_info)
+    reqs = []
+    for i in flagged_idx:
+        try:
+            reqs.append(_req_info(proc, batch.reqs[i], i, full))
+        except Exception as e:
+            reqs.append({"row": i, "error": repr(e)})
+    rec["reqs"] = reqs
+    _section(rec, "probe", _probe_table)
+    _section(rec, "recent_aborts", lambda: [{"age_s": round(now - t, 1), "rid": rid}
+                                            for t, rid in list(_S.aborts) if now - t <= _ABORT_WINDOW_S][-20:])
+    _log("NAN_INCIDENT", rec)
+    try:
         if _S.first_step is not None:  # localize the next incident too
             _S.first_step.fill_(-1)
             _S.first_pos.fill_(-1)
             torch.cuda.synchronize()
-    except Exception as e:  # never break the engine
-        _log("NAN_INCIDENT", {"incident": _S.incidents, "error": repr(e)})
+    except Exception as e:
+        _log("NAN_INCIDENT", {"incident": _S.incidents, "reset_error": repr(e)})
 
 
 def _page0_census(proc) -> Optional[torch.Tensor]:
