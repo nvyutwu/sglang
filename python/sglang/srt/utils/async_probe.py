@@ -6,7 +6,7 @@ sync point instead of as a silent NaN cascade or illegal-address crash.
 """
 
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -81,6 +81,29 @@ class _NanLogitsCounter:
 
 
 nan_logits_counter = _NanLogitsCounter()
+
+
+def flag_nan_rows(
+    logits: Optional[torch.Tensor],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Per-row NaN flags for SGLANG_ABORT_ON_NAN_LOGITS=1, before any sanitizing.
+
+    Returns (rows, any_host): ``rows`` is a device bool tensor with one entry per logits
+    row, and ``any_host`` a 1-element host tensor that says whether any row is NaN. On
+    CUDA it is pinned and filled by a non-blocking copy on the current stream, so it is
+    valid once the result's next_token_ids have reached the host. The scheduler reads
+    ``rows`` only when ``any_host`` is set, so the common case adds no host sync.
+    """
+    if not envs.SGLANG_ABORT_ON_NAN_LOGITS.get() or logits is None:
+        return None
+    rows2d = logits.reshape(-1, logits.shape[-1]) if logits.dim() > 1 else logits[None]
+    rows = torch.isnan(rows2d).any(dim=-1)
+    if rows.is_cuda:
+        any_host = torch.empty(1, dtype=torch.bool, pin_memory=True)
+        any_host.copy_(rows.any().reshape(1), non_blocking=True)
+    else:
+        any_host = rows.any().reshape(1)
+    return rows, any_host
 
 
 def count_nan_logits(logits: Optional[torch.Tensor]) -> None:

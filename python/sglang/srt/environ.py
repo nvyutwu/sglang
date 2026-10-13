@@ -1353,6 +1353,10 @@ class Envs:
     # Count sampled logits rows that contain NaN, without changing them, and export the
     # count as sglang:nan_logits_rows_total (see count_nan_logits). No host sync.
     SGLANG_COUNT_NAN_LOGITS = EnvBool(False)
+    # Finish a request with an error (HTTP 500, err_type InternalServerError) when its
+    # sampled logits row contains NaN, instead of returning text decoded from NaN logits
+    # (token id 0 under greedy). The rest of the batch is unaffected; see flag_nan_rows.
+    SGLANG_ABORT_ON_NAN_LOGITS = EnvBool(False)
     SGLANG_ENABLE_LOGPROB_CHUNK = EnvBool(True)
     SGLANG_LOGPROB_CHUNK_SIZE = EnvInt(2048)
     # Compute input logprobs from logits via per-row logsumexp instead of

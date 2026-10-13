@@ -23,7 +23,11 @@ from sglang.srt.layers.logprob_processor import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.utils.async_probe import count_nan_logits, sanitize_nan_logits
+from sglang.srt.utils.async_probe import (
+    count_nan_logits,
+    flag_nan_rows,
+    sanitize_nan_logits,
+)
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
@@ -172,6 +176,11 @@ class Sampler(nn.Module):
 
         if _is_hip and logits.shape[0] == 0:
             return torch.empty((0,), dtype=torch.int64, device=logits.device)
+
+        # Flag NaN rows before preprocessing can sanitize them (SGLANG_ABORT_ON_NAN_LOGITS)
+        nan_flags = flag_nan_rows(logits)
+        if nan_flags is not None:
+            logits_output.nan_rows, logits_output.nan_rows_any_host = nan_flags
 
         # Preprocess logits (custom processors and NaN handling)
         _trace_e2e_sampler("preprocess_enter")

@@ -43,6 +43,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_observability,
+    get_parallel,
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
@@ -291,6 +292,7 @@ class SchedulerBatchResultProcessor:
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
+            self.abort_nan_logits_reqs(batch, logits_output)
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
             self.materialize_sampling_mask_output(batch.reqs, logits_output)
 
@@ -948,6 +950,7 @@ class SchedulerBatchResultProcessor:
             logits_output=logits_output,
             next_token_ids=next_token_ids,
         )
+        self.abort_nan_logits_reqs(batch, logits_output)
 
         batch_size = batch.batch_size()
         num_generated_tokens = result.get_num_generated_tokens(batch_size)
@@ -1292,6 +1295,43 @@ class SchedulerBatchResultProcessor:
         output.next_token_sampling_logprobs = logprobs
         output.next_token_sampling_mask_status = status_by_batch
         output.sampling_mask_output = None
+
+    def abort_nan_logits_reqs(
+        self, batch: ScheduleBatch, logits_output: Optional[LogitsProcessorOutput]
+    ) -> None:
+        """SGLANG_ABORT_ON_NAN_LOGITS=1: finish every request whose sampled logits row
+        was NaN with an error instead of text decoded from NaN logits.
+
+        Rows of ``logits_output.nan_rows`` follow ``batch.reqs``. The host flag is read
+        first; ``nan_rows`` is copied to the host only when it is set, so normal steps
+        add no sync. Every TP rank sees the same gathered logits, so all ranks abort the
+        same requests. The engine frees the request's KV as for any other finish;
+        zero-on-alloc and the DCP page-table fix keep a NaN request from reaching
+        others. Speculative batches are skipped: their logits rows are draft positions,
+        not requests (as for SGLANG_COUNT_NAN_LOGITS).
+        """
+        if logits_output is None or not batch.spec_algorithm.is_none():
+            return
+        any_host = logits_output.nan_rows_any_host
+        if any_host is None or not bool(any_host[0]):
+            return
+        flags = logits_output.nan_rows.tolist()
+        for i, req in enumerate(batch.reqs):
+            if i >= len(flags) or not flags[i] or req.finished():
+                continue
+            req.to_finish = FINISH_ABORT(
+                "The engine produced NaN logits for this request; its output was "
+                "discarded. Retrying the request is safe.",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+            )
+            if get_parallel().tp_rank == 0:
+                logger.error(
+                    "NaN logits: aborting rid=%s (prompt %d tokens, %d generated)",
+                    req.rid,
+                    len(req.origin_input_ids),
+                    len(req.output_ids),
+                )
 
     def get_sampling_mask_finish_reason(
         self,

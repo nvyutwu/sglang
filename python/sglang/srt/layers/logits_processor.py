@@ -281,6 +281,11 @@ class LogitsProcessorOutput:
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
+    # SGLANG_ABORT_ON_NAN_LOGITS: per-row NaN flags of next_token_logits (device) and
+    # whether any row is NaN (host, valid once next_token_ids are on the host).
+    nan_rows: Optional[torch.Tensor] = None
+    nan_rows_any_host: Optional[torch.Tensor] = None
+
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
             return
