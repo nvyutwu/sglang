@@ -48,6 +48,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
+from sglang.srt.utils import nan_forensics
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionMetrics,
@@ -668,6 +669,9 @@ class ModelRunner:
         self.init_token_oracle()
         self.sampler = create_sampler()
         self.load_model()
+        if not self.is_draft_worker:
+            # SGLANG_NAN_FORENSICS: hooks must exist before CUDA graph capture.
+            nan_forensics.maybe_install(self.model)
         prepare_moe_topk(model=self.model, model_config=self.model_config)
 
         self.maybe_init_dwdp()

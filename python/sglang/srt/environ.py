@@ -1357,6 +1357,11 @@ class Envs:
     # sampled logits row contains NaN, instead of returning text decoded from NaN logits
     # (token id 0 under greedy). The rest of the batch is unaffected; see flag_nan_rows.
     SGLANG_ABORT_ON_NAN_LOGITS = EnvBool(False)
+    # Record where NaN first appears (per-layer attn/mlp outputs, FP8 conversion overflow)
+    # and log a NAN_INCIDENT line per rank, with a census of the request's own KV / KDA
+    # state, whenever a sampled logits row is NaN. Observation only; see nan_forensics.
+    SGLANG_NAN_FORENSICS = EnvBool(False)
+    SGLANG_NAN_FORENSICS_HEARTBEAT_S = EnvInt(600)
     SGLANG_ENABLE_LOGPROB_CHUNK = EnvBool(True)
     SGLANG_LOGPROB_CHUNK_SIZE = EnvInt(2048)
     # Compute input logprobs from logits via per-row logsumexp instead of

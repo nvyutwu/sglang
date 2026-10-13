@@ -94,7 +94,9 @@ def flag_nan_rows(
     valid once the result's next_token_ids have reached the host. The scheduler reads
     ``rows`` only when ``any_host`` is set, so the common case adds no host sync.
     """
-    if not envs.SGLANG_ABORT_ON_NAN_LOGITS.get() or logits is None:
+    if logits is None or not (
+        envs.SGLANG_ABORT_ON_NAN_LOGITS.get() or envs.SGLANG_NAN_FORENSICS.get()
+    ):
         return None
     rows2d = logits.reshape(-1, logits.shape[-1]) if logits.dim() > 1 else logits[None]
     rows = torch.isnan(rows2d).any(dim=-1)

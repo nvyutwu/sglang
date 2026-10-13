@@ -107,6 +107,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
+from sglang.srt.utils import nan_forensics
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -5304,6 +5305,7 @@ class Scheduler(
         return inflight_batches
 
     def abort_request(self, recv_req: AbortReq):
+        nan_forensics.note_abort(recv_req.rid, recv_req.abort_all)
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req

@@ -53,6 +53,7 @@ from sglang.srt.sampling.sampling_params import (
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils import nan_forensics
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
@@ -1310,15 +1311,25 @@ class SchedulerBatchResultProcessor:
         others. Speculative batches are skipped: their logits rows are draft positions,
         not requests (as for SGLANG_COUNT_NAN_LOGITS).
         """
+        nan_forensics.heartbeat()
         if logits_output is None or not batch.spec_algorithm.is_none():
             return
         any_host = logits_output.nan_rows_any_host
         if any_host is None or not bool(any_host[0]):
             return
         flags = logits_output.nan_rows.tolist()
-        for i, req in enumerate(batch.reqs):
-            if i >= len(flags) or not flags[i] or req.finished():
-                continue
+        flagged = [
+            i
+            for i, req in enumerate(batch.reqs)
+            if i < len(flags) and flags[i] and not req.finished()
+        ]
+        # SGLANG_NAN_FORENSICS: every rank logs its own view (where NaN first appeared,
+        # the request's KV / KDA state on this rank) before the request is freed.
+        nan_forensics.incident(self, batch, flagged)
+        if not envs.SGLANG_ABORT_ON_NAN_LOGITS.get():
+            return
+        for i in flagged:
+            req = batch.reqs[i]
             req.to_finish = FINISH_ABORT(
                 "The engine produced NaN logits for this request; its output was "
                 "discarded. Retrying the request is safe.",
