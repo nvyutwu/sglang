@@ -123,6 +123,28 @@ def create_mla_kv_page_table_for_dcp(
         pages.to(tl.int32),
         mask=mask,
     )
+    # Past this rank's last page, write that last page instead of leaving whatever an earlier batch (or CUDA-graph
+    # replay; the decode metadata buffer is persistent) put there. The cute-dsl MLA decode loads whole 128-token K
+    # tiles, i.e. two 64-token pages, so with an odd page count it reads the entry one past the last page. Its rows
+    # lie beyond seq_len and are masked arithmetically (0 * x), so a stale id that points at another request's NaN
+    # page turns this request NaN (Kimi-K3 token-0 collapse, onset where rank 0's page count becomes odd). The own
+    # last page holds this request's finite rows. Rows with no local page are not read by the decode kernel.
+    tail = (page_offsets >= local_pages) & (page_offsets < block_table_stride) & (local_pages > 0)
+    last_virtual = tl.load(
+        req_to_token_ptr
+        + req_pool_index * req_to_token_stride
+        + DCP_RANK
+        + (tl.maximum(local_pages, 1) - 1) * PHYSICAL_PAGE_SIZE * DCP_SIZE
+    )
+    last_page = last_virtual // DCP_SIZE // PHYSICAL_PAGE_SIZE
+    if HAS_V2P:
+        last_page = tl.where(last_virtual < 0, 0, last_page)
+        last_page = tl.maximum(tl.load(v2p_ptr + last_page), 0)
+    tl.store(
+        block_kv_indices_ptr + req * block_table_stride + page_offsets,
+        (tl.zeros_like(page_offsets) + last_page).to(tl.int32),
+        mask=tail,
+    )
 
 
 @triton.jit
