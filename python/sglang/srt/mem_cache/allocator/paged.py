@@ -15,6 +15,7 @@ limitations under the License.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -32,6 +33,8 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -132,6 +135,22 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        # The static MLA pool never zeroes a recycled page, and the MLA decode kernels mask the
+        # rows past seq_len arithmetically (0 * NaN = NaN). A stale NaN row in a handed-out page
+        # therefore poisons the request that receives it, and that request frees more NaN pages
+        # (Kimi-K3 token-0 collapse, 2026-10-12). Opt-in: zero pages on hand-out, as the unified
+        # pool does (`MultiEndedAlloc._maybe_zero_pages`).
+        self._zero_pages = None
+        if get_bool_env_var("SGLANG_ZERO_MLA_PAGES_ON_ALLOC"):
+            pool = getattr(kvcache, "full_kv_pool", kvcache)
+            if type(pool).__name__ == "MLATokenToKVPool":
+                self._zero_pages = pool.zero_pages
+                logger.info("Zeroing MLA KV pages on allocation (SGLANG_ZERO_MLA_PAGES_ON_ALLOC)")
+            else:
+                logger.warning(
+                    "SGLANG_ZERO_MLA_PAGES_ON_ALLOC ignored: KV pool %s is not MLATokenToKVPool",
+                    type(pool).__name__,
+                )
 
         # Pre-warm the torch.unique used by free(): on ROCm the first call
         # JIT-compiles rocPRIM sort/unique kernels and costs ~200ms.
@@ -172,6 +191,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
+        if self._zero_pages is not None and num_pages > 0:
+            self._zero_pages(out_pages)
 
         out_indices = (
             out_pages[:, None] * self.page_size
@@ -225,6 +246,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        # The kernels above hand out free_pages[:num_new_pages], in order.
+        if self._zero_pages is not None and num_new_pages > 0:
+            self._zero_pages(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -264,6 +288,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        # The kernels above hand out free_pages[:num_new_pages], in order.
+        if self._zero_pages is not None and num_new_pages > 0:
+            self._zero_pages(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 

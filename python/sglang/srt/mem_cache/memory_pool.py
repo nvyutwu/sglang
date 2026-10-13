@@ -4702,6 +4702,22 @@ class MLATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.kv_buffer
 
+    def zero_pages(self, page_ids: torch.Tensor) -> None:
+        """Zero whole pages in every layer (SGLANG_ZERO_MLA_PAGES_ON_ALLOC).
+
+        `page_ids` are allocator pages. Under DCP an allocator page spans
+        page_size * dcp_size widened slots, and this rank owns rows
+        [page_id * page_size, (page_id + 1) * page_size) of it (owner rule:
+        slot % dcp_size == rank, row = slot // dcp_size). Without DCP the two
+        page sizes are equal, so the same rows are meant.
+        """
+        rows = (
+            page_ids[:, None] * self.page_size
+            + torch.arange(self.page_size, device=page_ids.device)
+        ).reshape(-1)
+        for kv_cache in self.kv_buffer:
+            kv_cache.view(torch.uint8).index_fill_(0, rows, 0)
+
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
