@@ -52,6 +52,45 @@ class _AsyncNanWarner:
 _nan_warner = _AsyncNanWarner()
 
 
+class _NanLogitsCounter:
+    """Running count of logits rows that contain NaN. The device total is copied to
+    pinned host memory after every update without a stream sync, so total() lags the
+    device by at most a step; the metrics reporter exports the increase."""
+
+    def __init__(self):
+        self._dev = None
+        self._host = None
+
+    def add(self, logits: torch.Tensor) -> None:
+        if logits is None or logits.numel() == 0:
+            return
+        if self._dev is None:
+            self._dev = torch.zeros(1, dtype=torch.int64, device=logits.device)
+            self._host = (
+                torch.zeros(1, dtype=torch.int64, pin_memory=True)
+                if logits.is_cuda
+                else self._dev
+            )
+        rows = logits.reshape(-1, logits.shape[-1]) if logits.dim() > 1 else logits[None]
+        self._dev.add_(torch.isnan(rows).any(dim=-1).sum())
+        if self._host is not self._dev:
+            self._host.copy_(self._dev, non_blocking=True)
+
+    def total(self) -> int:
+        return int(self._host[0]) if self._host is not None else 0
+
+
+nan_logits_counter = _NanLogitsCounter()
+
+
+def count_nan_logits(logits: Optional[torch.Tensor]) -> None:
+    """Count rows with NaN before any sanitizing (SGLANG_COUNT_NAN_LOGITS=1). Logits are
+    left unchanged, so the failure stays visible in the output."""
+    if not envs.SGLANG_COUNT_NAN_LOGITS.get():
+        return
+    nan_logits_counter.add(logits)
+
+
 def maybe_warn_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     """Non-fatal counterpart of maybe_detect_nan: throttled sync-free warning
     instead of crashing. Callers sanitize the tensor themselves."""

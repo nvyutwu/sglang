@@ -36,6 +36,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     logs_expert_balancedness_to_server_log,
 )
+from sglang.srt.utils.async_probe import nan_logits_counter
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -207,6 +208,7 @@ class SchedulerMetricsReporter:
     metrics_collector: Optional[SchedulerMetricsCollector]
     num_retracted_reqs: int = 0
     num_paused_reqs: int = 0
+    nan_logits_reported: int = 0
 
     def __post_init__(self) -> None:
         self.enable_metrics = self.metrics_collector_context.enable_metrics
@@ -859,6 +861,7 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
+            self._report_nan_logits()
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
@@ -1105,6 +1108,7 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
+            self._report_nan_logits()
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
@@ -1187,6 +1191,21 @@ class SchedulerMetricsReporter:
         """Shut down the FPM publisher thread."""
         if self.scheduler.enable_fpm:
             self.scheduler._fpm_publisher.shutdown()
+
+    def _report_nan_logits(self):
+        """Export rows of NaN logits counted by the sampler (SGLANG_COUNT_NAN_LOGITS=1)."""
+        total = nan_logits_counter.total()
+        delta = total - self.nan_logits_reported
+        if delta <= 0:
+            return
+        self.nan_logits_reported = total
+        self.metrics_collector.increment_nan_logits_rows(delta)
+        logger.warning(
+            "NaN logits in %d sampled rows since the last report (%d in total). "
+            "Outputs of those requests are corrupt (token id 0 under greedy).",
+            delta,
+            total,
+        )
 
     def _log_hicache_stats(self):
         """Populate HiCache host-tier stats on self.stats.

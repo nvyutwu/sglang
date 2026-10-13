@@ -587,6 +587,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Total number of prefill retries.",
             labelnames=labels.keys(),
         )
+        self.nan_logits_rows_total = Counter(
+            name="sglang:nan_logits_rows_total",
+            documentation="Sampled logits rows (request-steps) that contained NaN. "
+            "Counted only with SGLANG_COUNT_NAN_LOGITS=1.",
+            labelnames=labels.keys(),
+        )
         self.kv_transfer_bootstrap_ms = Histogram(
             name="sglang:kv_transfer_bootstrap_ms",
             documentation="Histogram of KV transfer bootstrap time in ms.",
@@ -1238,6 +1244,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.decode_deferred_kv_release_total.labels(
             **self.labels, outcome=outcome
         ).inc(1)
+
+    def increment_nan_logits_rows(self, count: int) -> None:
+        if count > 0:
+            self.nan_logits_rows_total.labels(**self.labels).inc(count)
 
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:

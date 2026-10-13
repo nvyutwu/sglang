@@ -1350,6 +1350,9 @@ class Envs:
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
+    # Count sampled logits rows that contain NaN, without changing them, and export the
+    # count as sglang:nan_logits_rows_total (see count_nan_logits). No host sync.
+    SGLANG_COUNT_NAN_LOGITS = EnvBool(False)
     SGLANG_ENABLE_LOGPROB_CHUNK = EnvBool(True)
     SGLANG_LOGPROB_CHUNK_SIZE = EnvInt(2048)
     # Compute input logprobs from logits via per-row logsumexp instead of
